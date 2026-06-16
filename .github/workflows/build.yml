@@ -30,5 +30,3 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: imaginashaun/imagerunner:v2
-          build-args: |
-            HF_TOKEN=${{ secrets.HF_TOKEN }}
