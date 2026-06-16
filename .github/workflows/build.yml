@@ -23,7 +23,7 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build & push (baked: cu128 torch + sam3 + deps + handler)
+      - name: Build and push baked image
         uses: docker/build-push-action@v6
         with:
           context: .
