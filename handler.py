@@ -371,17 +371,34 @@ import shutil
 import subprocess
 import tempfile
 
-# Animation constants — mirror the browser renderer (image-narration-test.blade.php).
-V_BORDER_DUR = 0.6
-V_LIFT_DUR = 0.7
-V_SHIMMER_START = V_BORDER_DUR + V_LIFT_DUR
-V_SHIMMER_DUR = 1.2
-V_SHIMMER_END = V_SHIMMER_START + V_SHIMMER_DUR
-V_FADE = 0.4
-V_RAISE_FILL = 0.68
-V_RAISE_MIN = 0.45
-V_RAISE_MAX = 3.0
-V_ACCENT = (255, 107, 53)
+# ── Premium narration animation aesthetic ─────────────────────────────────────
+# Colour is reserved for the pointer + annotation; content cards keep their true
+# colours with soft shadows, so the result reads as elegant rather than garish.
+# Cropping uses a general ROUNDED-RECT shape from the base image (the jagged SAM
+# alpha mask is set aside) and every highlight "lifts" the card off the page.
+V_ACCENT = (255, 193, 84)        # warm amber — pointer + annotation accent
+V_ACCENT_HI = (255, 226, 170)    # pointer highlight tint
+V_ACCENT_EDGE = (120, 78, 12)    # pointer dark edge
+V_INK = (17, 19, 26)             # dark glass for the annotation pill
+
+# Timing (seconds)
+V_FADE = 0.32                    # fade-in for a gently-lifted card
+V_SETTLE = 0.55                  # gentle in-place lift settle
+V_BORDER_DUR = 0.42             # hero: brief in-place beat before it flies up
+V_LIFT_DUR = 0.85               # hero: travel-to-centre duration
+V_GLIDE = 0.55                  # pointer glide between targets
+V_ANNO_IN, V_ANNO_HOLD, V_ANNO_OUT = 0.3, 1.7, 0.55   # brief annotation envelope
+
+# Geometry
+V_RADIUS_FRAC = 0.05            # card corner radius (fraction of min side)
+V_RADIUS_MIN, V_RADIUS_MAX = 12, 48
+V_GENTLE_SCALE = 0.085          # extra scale when a card lifts in place
+V_GENTLE_RISE = 0.02            # how far it rises (fraction of H)
+V_RAISE_FILL = 0.62             # hero card target fill of the stage
+V_RAISE_MIN, V_RAISE_MAX = 0.5, 2.6
+V_DIM_GENTLE = 0.72            # base dim while a card is gently highlighted
+V_DIM_HERO = 0.26              # base dim under a hero lift
+V_AMBIENT = 0.02              # slow ambient breath/pan so frames are never static
 
 
 def _ffmpeg_exe():
@@ -423,6 +440,16 @@ def _ease_out_back(p):
     return 1 + c3 * (p - 1) ** 3 + c1 * (p - 1) ** 2
 
 
+def _ease_out(p):
+    p = _clamp(p, 0.0, 1.0)
+    return 1 - (1 - p) ** 3
+
+
+def _ease_in_out(p):
+    p = _clamp(p, 0.0, 1.0)
+    return p * p * (3 - 2 * p)
+
+
 def _with_opacity(img, op):
     if op >= 1.0:
         return img
@@ -441,33 +468,129 @@ def _brightness(img, factor):
     return out
 
 
-def _outline_layer(mask_img, color, px=3):
-    """Build a colored outline that follows the mask's alpha shape."""
+# ── Fonts (bundled DejaVu, with system fallbacks) ────────────────────────────
+_FONT_CACHE = {}
+
+
+def _font(size, bold=False):
+    key = (int(size), bool(bold))
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    from PIL import ImageFont
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "assets", name),
+        os.path.join("/app/assets", name),
+        "/usr/share/fonts/truetype/dejavu/" + name,
+        "/System/Library/Fonts/Supplemental/Arial%s.ttf" % (" Bold" if bold else ""),
+    ]
+    fnt = None
+    for c in candidates:
+        try:
+            fnt = ImageFont.truetype(c, int(size))
+            break
+        except Exception:
+            continue
+    if fnt is None:
+        fnt = ImageFont.load_default()
+    _FONT_CACHE[key] = fnt
+    return fnt
+
+
+# ── Shape + card helpers ─────────────────────────────────────────────────────
+def _vgrad(size, top_color, bottom_color):
+    w, h = size
+    strip = Image.new("RGBA", (1, max(1, h)))
+    for y in range(max(1, h)):
+        f = y / max(1, h - 1)
+        strip.putpixel((0, y), (
+            int(top_color[0] + (bottom_color[0] - top_color[0]) * f),
+            int(top_color[1] + (bottom_color[1] - top_color[1]) * f),
+            int(top_color[2] + (bottom_color[2] - top_color[2]) * f),
+            255,
+        ))
+    return strip.resize((w, h))
+
+
+def _rounded_mask(w, h, radius):
+    from PIL import ImageDraw
+    m = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(m).rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=255)
+    return m
+
+
+def _card_radius(w, h):
+    return int(_clamp(min(w, h) * V_RADIUS_FRAC, V_RADIUS_MIN, V_RADIUS_MAX))
+
+
+def _make_card(base, x1, y1, x2, y2):
+    """A general ROUNDED-RECT crop of the base image (the lifted 'card')."""
+    crop = base.crop((x1, y1, x2, y2)).convert("RGBA")
+    w, h = crop.size
+    crop.putalpha(_rounded_mask(w, h, _card_radius(w, h)))
+    return crop
+
+
+def _shadow_for(card_img, blur=18):
+    """Soft black silhouette used as the card's drop shadow."""
+    from PIL import ImageFilter
+    a = card_img.split()[3].filter(ImageFilter.GaussianBlur(blur))
+    layer = Image.new("RGBA", card_img.size, (0, 0, 0, 255))
+    layer.putalpha(a)
+    return layer
+
+
+def _rim_layer(card_img, strength=0.5):
+    """A subtle light rim around the card edge to sell its lift off the page."""
     from PIL import ImageChops, ImageFilter
-    a = mask_img.split()[3]
-    dil = a.filter(ImageFilter.MaxFilter(px * 2 + 1))
-    edge = ImageChops.subtract(dil, a)
-    layer = Image.new("RGBA", mask_img.size, color + (255,))
-    layer.putalpha(edge)
+    a = card_img.split()[3]
+    edge = ImageChops.subtract(a.filter(ImageFilter.MaxFilter(5)), a)
+    layer = Image.new("RGBA", card_img.size, (255, 255, 255, 255))
+    layer.putalpha(edge.point(lambda v: int(v * strength)))
     return layer
 
 
-def _glow_layer(mask_img, color, blur=10, strength=1.0):
-    from PIL import ImageFilter
-    a = mask_img.split()[3].filter(ImageFilter.GaussianBlur(blur))
-    a = a.point(lambda v: int(min(255, v * strength)))
-    layer = Image.new("RGBA", mask_img.size, color + (255,))
-    layer.putalpha(a)
-    return layer
+def _paste_card(frame, card, left, top, op, shadow=0.5, shadow_blur=20, shadow_dy=16, rim=True):
+    sh = _with_opacity(_shadow_for(card, shadow_blur), shadow * op)
+    frame.alpha_composite(sh, (left, top + shadow_dy))
+    if rim:
+        frame.alpha_composite(_with_opacity(_rim_layer(card), 0.9 * op), (left, top))
+    frame.alpha_composite(_with_opacity(card, op), (left, top))
 
 
-def _shadow_for(mask_img, blur=18):
-    """Soft black silhouette used as a drop/contact shadow."""
-    from PIL import ImageFilter
-    a = mask_img.split()[3].filter(ImageFilter.GaussianBlur(blur))
-    layer = Image.new("RGBA", mask_img.size, (0, 0, 0, 255))
-    layer.putalpha(a)
-    return layer
+# ── Scene -> render inputs ───────────────────────────────────────────────────
+def _build_objs(scene, base, W, H):
+    """Rounded-rect base crops for every object (no SAM masks)."""
+    objs = {}
+    for o in scene.get("objects", []):
+        x1, y1, x2, y2 = [float(v) for v in o["bbox"]]
+        x1 = int(_clamp(round(x1), 0, W - 2))
+        y1 = int(_clamp(round(y1), 0, H - 2))
+        x2 = int(_clamp(round(x2), x1 + 1, W))
+        y2 = int(_clamp(round(y2), y1 + 1, H))
+        objs[o["id"]] = {
+            "img": _make_card(base, x1, y1, x2, y2),
+            "left": x1, "top": y1, "w": x2 - x1, "h": y2 - y1,
+            "label": str(o.get("label") or ""),
+        }
+    return objs
+
+
+def _build_cues(scene, offsets, total):
+    cues = []
+    for c in scene.get("cues", []):
+        if c.get("time") is not None and c.get("audio_index") is not None and c["audio_index"] < len(offsets):
+            tt = offsets[c["audio_index"]] + float(c["time"])
+        else:
+            tt = float(c.get("progress", 0)) * total
+        cues.append({**c, "t": tt})
+    cues.sort(key=lambda c: c["t"])
+    by_obj = {}
+    for c in cues:
+        by_obj.setdefault(c["object_id"], []).append(c)
+    focus_seq = [c for c in cues if c.get("action") == "in"]
+    return by_obj, focus_seq
 
 
 def _active_state(t, by_obj):
@@ -488,118 +611,267 @@ def _active_state(t, by_obj):
     return active, presented, pres_cue
 
 
-def _compose_frame(t, base, objs, by_obj, W, H):
-    from PIL import ImageDraw
-    active, presented, pres_cue = _active_state(t, by_obj)
-    pres_elapsed = (t - pres_cue["t"]) if pres_cue else 0.0
-    presenting = presented is not None and pres_elapsed >= V_BORDER_DUR
+# ── Card geometry over time ──────────────────────────────────────────────────
+def _gentle_rect(o, elapsed, t, H):
+    p = _ease_out(_clamp(elapsed / V_SETTLE, 0.0, 1.0))
+    scale = 1.0 + V_GENTLE_SCALE * p
+    rise = (V_GENTLE_RISE * H) * p
+    bob = math.sin(t * 1.5) * (H * 0.0035) * p
+    nw = max(1, int(round(o["w"] * scale)))
+    nh = max(1, int(round(o["h"] * scale)))
+    cx = o["left"] + o["w"] / 2
+    cy = o["top"] + o["h"] / 2 - rise + bob
+    return nw, nh, int(round(cx - nw / 2)), int(round(cy - nh / 2))
 
-    frame = base
-    if presenting:
-        from PIL import ImageFilter
-        frame = _brightness(base.convert("RGBA").filter(ImageFilter.GaussianBlur(2)), 0.18)
+
+def _hero_rect(o, elapsed, t, W, H):
+    gw, gh = o["w"] / W, o["h"] / H
+    target = _clamp(min(V_RAISE_FILL / gw, V_RAISE_FILL / gh), V_RAISE_MIN, V_RAISE_MAX)
+    lp = _ease_out_back(_clamp((elapsed - V_BORDER_DUR) / V_LIFT_DUR, 0.0, 1.0))
+    scale = 1.0 + (target - 1.0) * lp
+    start_cx, start_cy = o["left"] + o["w"] / 2, o["top"] + o["h"] / 2
+    settled = max(0.0, elapsed - (V_BORDER_DUR + V_LIFT_DUR))
+    bob = math.sin(settled * 1.4) * (H * 0.01)
+    end_cx, end_cy = W / 2, H * 0.54 + bob
+    cx = start_cx + (end_cx - start_cx) * lp
+    cy = start_cy + (end_cy - start_cy) * lp
+    nw = max(1, int(round(o["w"] * scale)))
+    nh = max(1, int(round(o["h"] * scale)))
+    return nw, nh, int(round(cx - nw / 2)), int(round(cy - nh / 2))
+
+
+# ── Floating 3D pointer ──────────────────────────────────────────────────────
+_ARROW_CACHE = {}
+
+
+def _arrow_img(size):
+    """A glossy, bevelled arrow pointing DOWN (tip at bottom centre), cached."""
+    size = int(size)
+    if size in _ARROW_CACHE:
+        return _ARROW_CACHE[size]
+    from PIL import ImageChops, ImageDraw, ImageFilter
+    Wd = size
+    Hd = int(size * 1.3)
+    pad = int(size * 0.45)
+    canvas = (Wd + pad * 2, Hd + pad * 2)
+    ox, oy = pad, pad
+    shaft_w = Wd * 0.42
+    shaft_h = Hd * 0.46
+    pts = [
+        (ox + Wd / 2 - shaft_w / 2, oy),
+        (ox + Wd / 2 + shaft_w / 2, oy),
+        (ox + Wd / 2 + shaft_w / 2, oy + shaft_h),
+        (ox + Wd, oy + shaft_h),
+        (ox + Wd / 2, oy + Hd),
+        (ox, oy + shaft_h),
+        (ox + Wd / 2 - shaft_w / 2, oy + shaft_h),
+    ]
+    sil = Image.new("L", canvas, 0)
+    ImageDraw.Draw(sil).polygon(pts, fill=255)
+
+    body = Image.composite(_vgrad(canvas, V_ACCENT_HI, V_ACCENT), Image.new("RGBA", canvas, (0, 0, 0, 0)), sil)
+
+    edge = ImageChops.subtract(sil.filter(ImageFilter.MaxFilter(5)), sil)
+    outline = Image.new("RGBA", canvas, V_ACCENT_EDGE + (255,))
+    outline.putalpha(edge)
+
+    spec = Image.new("L", canvas, 0)
+    ImageDraw.Draw(spec).polygon([
+        (ox + Wd / 2 - shaft_w / 2 + 2, oy + 2),
+        (ox + Wd / 2 - 2, oy + 2),
+        (ox + Wd / 2 - 2, oy + shaft_h),
+        (ox + Wd / 2 - shaft_w / 2 + 2, oy + shaft_h),
+    ], fill=90)
+    spec = ImageChops.multiply(spec, sil)
+    specL = Image.new("RGBA", canvas, (255, 255, 255, 255))
+    specL.putalpha(spec.filter(ImageFilter.GaussianBlur(1)))
+
+    sh = sil.filter(ImageFilter.GaussianBlur(int(size * 0.13)))
+    shadow = Image.new("RGBA", canvas, (0, 0, 0, 255))
+    shadow.putalpha(sh.point(lambda v: int(v * 0.5)))
+
+    out = Image.new("RGBA", canvas, (0, 0, 0, 0))
+    out.alpha_composite(shadow, (0, int(size * 0.12)))
+    out.alpha_composite(outline)
+    out.alpha_composite(body)
+    out.alpha_composite(specL)
+    # tip offset from the image's top-left (used to anchor the tip on target).
+    meta = {"tip": (canvas[0] / 2, oy + Hd), "size": canvas}
+    _ARROW_CACHE[size] = (out, meta)
+    return _ARROW_CACHE[size]
+
+
+def _focus_at(t, focus_seq):
+    cur, prev = None, None
+    for c in focus_seq:
+        if c["t"] <= t + 1e-6:
+            prev, cur = cur, c
+        else:
+            break
+    return cur, prev
+
+
+def _target_top_center(oid, objs, by_obj, t, W, H):
+    """Where the pointer should aim: the top-centre of the object's card NOW."""
+    o = objs.get(oid)
+    if not o:
+        return (W / 2, H * 0.2)
+    cue = None
+    for c in by_obj.get(oid, []):
+        if c["t"] <= t + 1e-6:
+            cue = c
+        else:
+            break
+    e = (t - cue["t"]) if cue else 0.0
+    if cue and cue["type"] == "raise" and e >= V_BORDER_DUR:
+        nw, nh, left, top = _hero_rect(o, e, t, W, H)
+    else:
+        nw, nh, left, top = _gentle_rect(o, e, t, H)
+    return (left + nw / 2, top)
+
+
+def _draw_pointer(frame, focus_seq, objs, by_obj, t, W, H):
+    cur, prev = _focus_at(t, focus_seq)
+    if not cur:
+        return None
+    arrow, meta = _arrow_img(int(_clamp(min(W, H) * 0.058, 34, 112)))
+    aw, ah = meta["size"]
+    tipx_off, tipy_off = meta["tip"]
+
+    cur_pt = _target_top_center(cur["object_id"], objs, by_obj, t, W, H)
+    if prev:
+        prev_pt = _target_top_center(prev["object_id"], objs, by_obj, t, W, H)
+        gp = _ease_in_out(_clamp((t - cur["t"]) / V_GLIDE, 0.0, 1.0))
+    else:
+        prev_pt, gp = cur_pt, 1.0
+
+    tip_x = prev_pt[0] + (cur_pt[0] - prev_pt[0]) * gp
+    tip_y = prev_pt[1] + (cur_pt[1] - prev_pt[1]) * gp
+    gap = ah * 0.10 + math.sin(t * 2.3) * (ah * 0.05)   # hover above + idle bob
+    tip_y -= gap
+
+    left = int(round(tip_x - tipx_off))
+    top = int(round(tip_y - tipy_off))
+    op = _clamp((t - cur["t"]) / 0.3, 0.0, 1.0) if not prev else 1.0
+    frame.alpha_composite(_with_opacity(arrow, op), (left, top))
+    return (tip_x, top)   # anchor for the annotation (arrow body top)
+
+
+def _draw_annotation(frame, text, anchor, t, t0, W, H):
+    e = t - t0
+    if e < 0:
+        return
+    if e < V_ANNO_IN:
+        op = e / V_ANNO_IN
+    elif e < V_ANNO_IN + V_ANNO_HOLD:
+        op = 1.0
+    elif e < V_ANNO_IN + V_ANNO_HOLD + V_ANNO_OUT:
+        op = 1.0 - (e - V_ANNO_IN - V_ANNO_HOLD) / V_ANNO_OUT
+    else:
+        return
+    text = text.strip()
+    if not text:
+        return
+    from PIL import ImageDraw
+    fs = int(_clamp(min(W, H) * 0.03, 16, 42))
+    fnt = _font(fs, bold=True)
+    layer = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    tb = d.textbbox((0, 0), text, font=fnt)
+    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+    dot = int(fs * 0.42)
+    padx, pady = int(fs * 0.7), int(fs * 0.5)
+    gap = int(fs * 0.45)
+    pillw = padx + dot + gap + tw + padx
+    pillh = th + pady * 2
+    anchor_x, arrow_top = anchor
+    x0 = int(_clamp(anchor_x - pillw / 2, 8, W - pillw - 8))
+    y0 = int(arrow_top - pillh - int(fs * 0.45))
+    if y0 < 8:
+        y0 = int(_clamp(arrow_top + int(fs * 0.45), 8, H - pillh - 8))
+    d.rounded_rectangle([x0, y0, x0 + pillw, y0 + pillh], radius=int(pillh / 2), fill=V_INK + (236,))
+    d.rounded_rectangle([x0, y0, x0 + pillw, y0 + pillh], radius=int(pillh / 2), outline=V_ACCENT + (90,), width=2)
+    cy = y0 + pillh / 2
+    d.ellipse([x0 + padx, cy - dot / 2, x0 + padx + dot, cy + dot / 2], fill=V_ACCENT + (255,))
+    d.text((x0 + padx + dot + gap, y0 + pady - tb[1]), text, font=fnt, fill=(248, 249, 252, 255))
+    frame.alpha_composite(_with_opacity(layer, op))
+
+
+def _compose_frame(t, base, objs, by_obj, focus_seq, W, H):
+    from PIL import ImageFilter
+    active, presented, pres_cue = _active_state(t, by_obj)
+    cur, _prev = _focus_at(t, focus_seq)
+
+    # A hero (raise) holds centre-stage, but must YIELD as soon as a newer focus
+    # begins — otherwise it lingers while the pointer has already moved on. When
+    # superseded it cross-fades out over V_FADE instead of cutting.
+    superseded = (presented is not None and cur is not None
+                  and cur["object_id"] != presented and cur["t"] > pres_cue["t"] + 1e-6)
+    pres_elapsed = (t - pres_cue["t"]) if pres_cue else 0.0
+    hero = presented is not None and pres_elapsed >= V_BORDER_DUR and not superseded
+
+    if hero:
+        frame = _brightness(base.convert("RGBA").filter(ImageFilter.GaussianBlur(2)), V_DIM_HERO)
+    elif active:
+        frame = _brightness(base.convert("RGBA"), V_DIM_GENTLE)
     else:
         frame = base.convert("RGBA").copy()
 
     def fade(c):
         return _clamp((t - c["t"]) / V_FADE, 0.0, 1.0) if V_FADE > 0 else 1.0
 
-    def paste_in_place(oid, op, layer_extra=None):
-        o = objs[oid]
-        img = _with_opacity(o["img"], op)
-        if layer_extra is not None:
-            le = _with_opacity(layer_extra, op)
-            frame.alpha_composite(le, (o["left"], o["top"]))
-        frame.alpha_composite(img, (o["left"], o["top"]))
-
-    # --- Non-presented objects: in-place effects ---
-    for oid, c in active.items():
-        if oid == presented:
-            continue
-        if presenting:
-            paste_in_place(oid, 0.12)  # receded behind the lifted object
-            continue
-        op = fade(c)
-        typ = c["type"]
-        o = objs[oid]
-        if typ == "border":
-            paste_in_place(oid, op, _outline_layer(o["img"], V_ACCENT, 3))
-        elif typ == "flash":
-            pulse = 1.0 + 0.4 * abs(math.sin(t * 6.0))
-            paste_in_place_img(frame, _brightness(o["img"], pulse), o, op)
-        elif typ == "arrow":
-            paste_in_place(oid, op, _glow_layer(o["img"], V_ACCENT, 8, 0.8))
-            _draw_arrow(frame, o, op)
-        else:
-            paste_in_place(oid, op, _glow_layer(o["img"], (255, 255, 255), 8, 0.4))
-
-    # --- Presented object: border-in-place -> lift -> shimmer/hold ---
-    if presented is not None:
+    if hero:
+        # Sole focus: the one card centre-stage.
         o = objs[presented]
-        op = fade(pres_cue)
-        if not presenting:
-            # Border draws around the object where it sits.
-            paste_in_place(presented, op, _outline_layer(o["img"], V_ACCENT, 3))
-        else:
-            _paste_lifted(frame, o, pres_elapsed, t, W, H, op)
+        nw, nh, left, top = _hero_rect(o, pres_elapsed, t, W, H)
+        _paste_card(frame, o["img"].resize((nw, nh)), left, top, fade(pres_cue),
+                    shadow=0.62, shadow_blur=int(max(16, nh * 0.06)), shadow_dy=int(H * 0.05))
+    else:
+        # Gently-lifted cards for every active object (presented handled below).
+        for oid, c in active.items():
+            if oid == presented:
+                continue
+            o = objs[oid]
+            nw, nh, left, top = _gentle_rect(o, t - c["t"], t, H)
+            _paste_card(frame, o["img"].resize((nw, nh)), left, top, fade(c),
+                        shadow=0.55, shadow_blur=int(max(10, nh * 0.06)), shadow_dy=int(max(8, nh * 0.06)))
+        if presented is not None:
+            o = objs[presented]
+            if superseded:
+                # Hero crossfades out from its lifted position as the next card arrives.
+                op = 1.0 - _clamp((t - cur["t"]) / V_FADE, 0.0, 1.0)
+                if op > 0.01:
+                    nw, nh, left, top = _hero_rect(o, pres_elapsed, t, W, H)
+                    _paste_card(frame, o["img"].resize((nw, nh)), left, top, op,
+                                shadow=0.62, shadow_blur=int(max(16, nh * 0.06)), shadow_dy=int(H * 0.05))
+            else:
+                # Brief in-place beat before the lift to centre.
+                nw, nh, left, top = _gentle_rect(o, pres_elapsed, t, H)
+                _paste_card(frame, o["img"].resize((nw, nh)), left, top, fade(pres_cue),
+                            shadow=0.5, shadow_blur=int(max(8, nh * 0.05)), shadow_dy=int(max(6, nh * 0.045)))
 
-    return frame.convert("RGB")
+    # Floating pointer + brief annotation callout (audio-driven via focus_seq).
+    anchor = _draw_pointer(frame, focus_seq, objs, by_obj, t, W, H)
+    if cur and anchor:
+        label = objs.get(cur["object_id"], {}).get("label", "")
+        _draw_annotation(frame, label, anchor, t, cur["t"], W, H)
+
+    return _ambient(frame, t, W, H).convert("RGB")
 
 
-def paste_in_place_img(frame, img, o, op):
-    frame.alpha_composite(_with_opacity(img, op), (o["left"], o["top"]))
+def _ambient(frame, t, W, H):
+    """A very slow breath + drift on the whole composition so the frame is never
+    fully static, without disturbing the object coordinates."""
+    z = V_AMBIENT * (0.5 - 0.5 * math.cos(t * 2 * math.pi / 16.0))
+    if z <= 0.0005:
+        return frame
+    nw, nh = int(round(W * (1 + z))), int(round(H * (1 + z)))
+    big = frame.resize((nw, nh))
+    px = math.sin(t * 2 * math.pi / 37.0) * 0.5 + 0.5
+    py = math.cos(t * 2 * math.pi / 41.0) * 0.5 + 0.5
+    ox, oy = int((nw - W) * px), int((nh - H) * py)
+    return big.crop((ox, oy, ox + W, oy + H))
 
-
-def _draw_arrow(frame, o, op):
-    from PIL import ImageDraw
-    cx = o["left"] + o["w"] / 2
-    top = o["top"]
-    size = max(14, int(o["w"] * 0.12))
-    y = max(2, top - size - 6)
-    layer = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    d.polygon([(cx - size / 2, y), (cx + size / 2, y), (cx, y + size)],
-              fill=V_ACCENT + (int(255 * op),))
-    frame.alpha_composite(layer)
-
-
-def _paste_lifted(frame, o, elapsed, t, W, H, op):
-    # Lift progress with overshoot from in-place (scale 1 @ bbox centre) to target.
-    gw, gh = o["w"] / W, o["h"] / H
-    target_scale = _clamp(min(V_RAISE_FILL / gw, V_RAISE_FILL / gh), V_RAISE_MIN, V_RAISE_MAX)
-    lp = _ease_out_back((elapsed - V_BORDER_DUR) / V_LIFT_DUR)
-    scale = 1.0 + (target_scale - 1.0) * lp
-
-    start_cx, start_cy = o["left"] + o["w"] / 2, o["top"] + o["h"] / 2
-    # Gentle hover once settled.
-    settled = max(0.0, elapsed - V_SHIMMER_START)
-    bob = math.sin(settled * 1.7) * (H * 0.012)
-    end_cx, end_cy = W / 2, H / 2 + bob
-    cx = start_cx + (end_cx - start_cx) * lp
-    cy = start_cy + (end_cy - start_cy) * lp
-
-    new_w = max(1, int(round(o["w"] * scale)))
-    new_h = max(1, int(round(o["h"] * scale)))
-    mask = o["img"].resize((new_w, new_h))
-
-    # Shimmer burst (≈3 pulses) right after enlarging.
-    if V_SHIMMER_START <= elapsed < V_SHIMMER_END:
-        pulse = 1.0 + 0.5 * abs(math.sin((elapsed - V_SHIMMER_START) * math.pi / 0.4))
-        mask = _brightness(mask, pulse)
-
-    left = int(round(cx - new_w / 2))
-    top = int(round(cy - new_h / 2))
-
-    # Separated drop shadow (sells the height off the page).
-    shadow = _shadow_for(mask, blur=22)
-    shadow = _with_opacity(shadow, 0.55 * op)
-    frame.alpha_composite(shadow, (left, top + int(H * 0.06)))
-
-    # Slow border shimmer carried with the lift.
-    glow = max(0.4, 0.7 + 0.3 * math.sin(t * 2.8))
-    frame.alpha_composite(_with_opacity(_glow_layer(mask, V_ACCENT, 12, glow), op), (left, top))
-    frame.alpha_composite(_with_opacity(_outline_layer(mask, V_ACCENT, 3), op), (left, top))
-    frame.alpha_composite(_with_opacity(mask, op), (left, top))
 
 
 # Frame compositing is CPU-bound (Pillow); fan it out across all cores so a
@@ -607,13 +879,13 @@ def _paste_lifted(frame, o, elapsed, t, W, H, op):
 _MP = {}
 
 
-def _mp_init(base, objs, by_obj, W, H, frames_dir):
-    _MP.update(base=base, objs=objs, by_obj=by_obj, W=W, H=H, dir=frames_dir)
+def _mp_init(base, objs, by_obj, focus_seq, W, H, frames_dir):
+    _MP.update(base=base, objs=objs, by_obj=by_obj, focus_seq=focus_seq, W=W, H=H, dir=frames_dir)
 
 
 def _mp_frame(args):
     fi, t = args
-    _compose_frame(t, _MP["base"], _MP["objs"], _MP["by_obj"], _MP["W"], _MP["H"]).save(
+    _compose_frame(t, _MP["base"], _MP["objs"], _MP["by_obj"], _MP["focus_seq"], _MP["W"], _MP["H"]).save(
         os.path.join(_MP["dir"], f"f{fi:05d}.png"))
 
 
@@ -627,13 +899,9 @@ def render_narration_video(scene, fps=24):
         H -= H % 2
         base = base.crop((0, 0, W, H))
 
-        objs = {}
-        for o in scene.get("objects", []):
-            x1, y1, x2, y2 = [float(v) for v in o["bbox"]]
-            w = max(1, int(round(x2 - x1)))
-            h = max(1, int(round(y2 - y1)))
-            img = _v_load_image(o["masked_image_url"]).convert("RGBA").resize((w, h))
-            objs[o["id"]] = {"img": img, "left": int(round(x1)), "top": int(round(y1)), "w": w, "h": h}
+        # Rounded-rect crops from the base image (general shapes that "lift"); the
+        # jagged SAM alpha masks are set aside.
+        objs = _build_objs(scene, base, W, H)
 
         tracks = scene.get("audio", {}).get("tracks", [])
         audio_files, durations = [], []
@@ -649,17 +917,7 @@ def render_narration_video(scene, fps=24):
             acc += d
         total = acc if acc > 0 else 1.0
 
-        cues = []
-        for c in scene.get("cues", []):
-            if c.get("time") is not None and c.get("audio_index") is not None and c["audio_index"] < len(offsets):
-                tt = offsets[c["audio_index"]] + float(c["time"])
-            else:
-                tt = float(c.get("progress", 0)) * total
-            cues.append({**c, "t": tt})
-        cues.sort(key=lambda c: c["t"])
-        by_obj = {}
-        for c in cues:
-            by_obj.setdefault(c["object_id"], []).append(c)
+        by_obj, focus_seq = _build_cues(scene, offsets, total)
 
         nframes = max(1, int(math.ceil(total * fps)))
         frames_dir = os.path.join(work, "frames")
@@ -669,10 +927,10 @@ def render_narration_video(scene, fps=24):
         if nproc > 1 and nframes > 8:
             import multiprocessing as mp
             with mp.Pool(processes=nproc, initializer=_mp_init,
-                         initargs=(base, objs, by_obj, W, H, frames_dir)) as pool:
+                         initargs=(base, objs, by_obj, focus_seq, W, H, frames_dir)) as pool:
                 pool.map(_mp_frame, frame_args, chunksize=4)
         else:
-            _mp_init(base, objs, by_obj, W, H, frames_dir)
+            _mp_init(base, objs, by_obj, focus_seq, W, H, frames_dir)
             for a in frame_args:
                 _mp_frame(a)
 

@@ -32,6 +32,9 @@ RUN mkdir -p /app
 # Copy handler
 COPY handler.py /app/handler.py
 
+# Copy bundled fonts used by the narration-video annotations.
+COPY assets /app/assets
+
 # Copy boot script (lightweight - just sets env and launches handler)
 COPY boot_docker.py /app/boot.py
 
