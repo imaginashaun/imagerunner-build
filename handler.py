@@ -248,6 +248,116 @@ def upload_mask_to_s3(masked_img):
         return f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/{s3_key}"
 
 
+# ── Box-prompted segmentation (Grounded-SAM) ─────────────────────────────────
+# A caller (e.g. a VLM that read the whole diagram) provides a box per region.
+# SAM 3 turns each box into a precise alpha mask via the native geometric prompt,
+# so complex objects lift/separate cleanly instead of being rectangular crops.
+
+def _rect_object(image, idx, label, bbox, description):
+    """Fallback: a rectangular RGBA crop of the box (used if SAM returns nothing)."""
+    x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(image.width, x2), min(image.height, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    crop = image.crop((x1, y1, x2, y2)).convert("RGBA")
+    url = upload_mask_to_s3(crop)
+    return {
+        "id": f"obj_{idx + 1}", "label": label, "bbox": [x1, y1, x2, y2],
+        "masked_image_url": url, "score": 0.3, "description": description, "mask_kind": "rect",
+    }
+
+
+def segment_with_boxes(image, regions):
+    """Box-prompted SAM 3 segmentation.
+
+    regions: [{"label": str, "bbox": [x1,y1,x2,y2] (pixels), "description"?: str}].
+    For each box we call ``add_geometric_prompt`` (box as normalized cx,cy,w,h) and
+    keep the returned mask whose box best matches the requested region. Falls back
+    to a rectangular crop when SAM returns nothing for a box.
+    """
+    W, H = image.size
+    objects = []
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        state = sam3_processor.set_image(image)
+
+        for idx, region in enumerate(regions):
+            label = str(region.get("label") or f"region {idx + 1}")
+            description = str(region.get("description") or "")
+            bb = region.get("bbox") or []
+            if len(bb) != 4:
+                continue
+
+            try:
+                x1, y1, x2, y2 = [float(v) for v in bb]
+            except (TypeError, ValueError):
+                continue
+
+            # Clamp + order the requested box to the image.
+            x1, x2 = max(0.0, min(x1, x2)), min(float(W), max(x1, x2))
+            y1, y2 = max(0.0, min(y1, y2)), min(float(H), max(y1, y2))
+            if (x2 - x1) < 4 or (y2 - y1) < 4:
+                continue
+
+            requested = [x1, y1, x2, y2]
+            # SAM 3 geometric prompt wants a normalized [cx, cy, w, h] box.
+            norm_box = [((x1 + x2) / 2.0) / W, ((y1 + y2) / 2.0) / H, (x2 - x1) / W, (y2 - y1) / H]
+
+            try:
+                sam3_processor.reset_all_prompts(state)
+                out = sam3_processor.add_geometric_prompt(box=norm_box, label=True, state=state)
+                masks = out.get("masks")
+                boxes = out.get("boxes")
+                scores = out.get("scores")
+
+                if masks is None or len(masks) == 0:
+                    obj = _rect_object(image, idx, label, requested, description)
+                    if obj:
+                        objects.append(obj)
+                    continue
+
+                # Pick the returned mask whose box best overlaps the requested box.
+                best_i, best_key = 0, -1.0
+                for i in range(len(masks)):
+                    ob = boxes[i].cpu().tolist() if hasattr(boxes[i], "cpu") else list(boxes[i])
+                    score = float(scores[i]) if scores is not None else 0.5
+                    key = _calc_iou(requested, ob) + 0.001 * score
+                    if key > best_key:
+                        best_key, best_i = key, i
+
+                obox = boxes[best_i].cpu().tolist() if hasattr(boxes[best_i], "cpu") else list(boxes[best_i])
+                mask = masks[best_i].squeeze(0)
+                masked = create_masked_crop(image, mask, obox)
+                if masked is None:
+                    obj = _rect_object(image, idx, label, requested, description)
+                    if obj:
+                        objects.append(obj)
+                    continue
+
+                url = upload_mask_to_s3(masked)
+                objects.append({
+                    "id": f"obj_{idx + 1}",
+                    "label": label,
+                    "bbox": [float(v) for v in obox],
+                    "masked_image_url": url,
+                    "score": round(float(scores[best_i]) if scores is not None else 0.5, 4),
+                    "description": description,
+                    "mask_kind": "sam",
+                })
+
+            except Exception as e:
+                print(f"[BOX] region {idx} ('{label}') failed: {e}", flush=True)
+                try:
+                    obj = _rect_object(image, idx, label, requested, description)
+                    if obj:
+                        objects.append(obj)
+                except Exception:
+                    pass
+
+    return objects
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Image-narration VIDEO rendering
 # ══════════════════════════════════════════════════════════════════════════════
@@ -659,6 +769,27 @@ def handler(job):
     # Test mode
     if inp.get("test"):
         return {"status": "ok", "model_loaded": True, "message": "SAM3 handler ready"}
+
+    # Box-prompted mode: caller supplies a box per region (Grounded-SAM).
+    if inp.get("mode") == "segment_boxes" or inp.get("regions"):
+        image_url = inp.get("image_url")
+        regions = inp.get("regions") or []
+        if not image_url:
+            raise ValueError("segment_boxes mode requires input.image_url")
+        if not regions:
+            raise ValueError("segment_boxes mode requires input.regions")
+
+        print(f"[BOX] Processing {len(regions)} regions for {image_url}", flush=True)
+        resp = http_requests.get(image_url, timeout=30)
+        resp.raise_for_status()
+        image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        w, h = image.size
+
+        objects = segment_with_boxes(image, regions)
+        unique_labels = list(dict.fromkeys(o["label"] for o in objects))
+        caption = f"Image containing: {', '.join(unique_labels)}" if unique_labels else "Educational image"
+        print(f"[BOX] ✅ Returning {len(objects)} masked objects", flush=True)
+        return {"caption": caption, "image_width": w, "image_height": h, "objects": objects}
 
     image_url = inp.get("image_url")
     custom_prompts = inp.get("prompts")
