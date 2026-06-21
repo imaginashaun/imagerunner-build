@@ -398,6 +398,7 @@ V_RAISE_FILL = 0.62             # hero card target fill of the stage
 V_RAISE_MIN, V_RAISE_MAX = 0.5, 2.6
 V_DIM_GENTLE = 0.72            # base dim while a card is gently highlighted
 V_DIM_HERO = 0.26              # base dim under a hero lift
+V_DIM_SECTION = 0.4           # base dim outside the current section's spotlight
 V_AMBIENT = 0.02              # slow ambient breath/pan so frames are never static
 
 
@@ -591,6 +592,56 @@ def _build_cues(scene, offsets, total):
         by_obj.setdefault(c["object_id"], []).append(c)
     focus_seq = [c for c in cues if c.get("action") == "in"]
     return by_obj, focus_seq
+
+
+def _build_sections(scene, W, H):
+    """Pedagogical sections {id,label,role,item_ids,bbox(px, clamped)} -> the
+    renderer spotlights the active one and shows its label as a signpost."""
+    out = {}
+    for s in scene.get("sections", []):
+        bb = s.get("bbox") or []
+        if len(bb) != 4:
+            continue
+        x1 = int(_clamp(round(float(bb[0])), 0, W - 2))
+        y1 = int(_clamp(round(float(bb[1])), 0, H - 2))
+        x2 = int(_clamp(round(float(bb[2])), x1 + 1, W))
+        y2 = int(_clamp(round(float(bb[3])), y1 + 1, H))
+        out[s["id"]] = {
+            "id": s["id"], "label": str(s.get("label") or ""), "role": str(s.get("role") or "other"),
+            "item_ids": list(s.get("item_ids") or []),
+            "left": x1, "top": y1, "w": x2 - x1, "h": y2 - y1,
+        }
+    return out
+
+
+def _section_of_item(oid, sections):
+    for sid, s in sections.items():
+        if oid in s["item_ids"]:
+            return sid
+    return None
+
+
+def _build_section_timeline(focus_seq, sections):
+    """Collapse the focus order into contiguous per-section RUNS, each with the
+    time its first item is named. The active section persists for the whole run."""
+    timeline = []
+    for c in focus_seq:
+        sid = _section_of_item(c["object_id"], sections)
+        if sid is None:
+            continue
+        if not timeline or timeline[-1]["section_id"] != sid:
+            timeline.append({"section_id": sid, "t": c["t"]})
+    return timeline
+
+
+def _active_section(t, timeline):
+    cur = None
+    for run in timeline:
+        if run["t"] <= t + 1e-6:
+            cur = run
+        else:
+            break
+    return cur
 
 
 def _active_state(t, by_obj):
@@ -797,7 +848,7 @@ def _draw_annotation(frame, text, anchor, t, t0, W, H):
     frame.alpha_composite(_with_opacity(layer, op))
 
 
-def _compose_frame(t, base, objs, by_obj, focus_seq, W, H):
+def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline, W, H):
     from PIL import ImageFilter
     active, presented, pres_cue = _active_state(t, by_obj)
     cur, _prev = _focus_at(t, focus_seq)
@@ -810,12 +861,24 @@ def _compose_frame(t, base, objs, by_obj, focus_seq, W, H):
     pres_elapsed = (t - pres_cue["t"]) if pres_cue else 0.0
     hero = presented is not None and pres_elapsed >= V_BORDER_DUR and not superseded
 
+    # The current pedagogical SECTION (drives the spotlight + signpost label),
+    # unless a hero lift takes the whole stage.
+    sec_run = _active_section(t, section_timeline) if sections else None
+    sec = sections.get(sec_run["section_id"]) if sec_run else None
+    spotlight = sec is not None and not hero
+
     if hero:
         frame = _brightness(base.convert("RGBA").filter(ImageFilter.GaussianBlur(2)), V_DIM_HERO)
+    elif spotlight:
+        frame = _brightness(base.convert("RGBA"), V_DIM_SECTION)
     elif active:
         frame = _brightness(base.convert("RGBA"), V_DIM_GENTLE)
     else:
         frame = base.convert("RGBA").copy()
+
+    # Re-brighten the active section as a spotlight window + show its label.
+    if spotlight:
+        _draw_section_spotlight(frame, base, sec, t - sec_run["t"], W, H)
 
     def fade(c):
         return _clamp((t - c["t"]) / V_FADE, 0.0, 1.0) if V_FADE > 0 else 1.0
@@ -827,9 +890,10 @@ def _compose_frame(t, base, objs, by_obj, focus_seq, W, H):
         _paste_card(frame, o["img"].resize((nw, nh)), left, top, fade(pres_cue),
                     shadow=0.62, shadow_blur=int(max(16, nh * 0.06)), shadow_dy=int(H * 0.05))
     else:
-        # Gently-lifted cards for every active object (presented handled below).
+        # Active items: point = arrow only (the item already sits bright in the
+        # spotlight); border = gentle in-place lift card.
         for oid, c in active.items():
-            if oid == presented:
+            if oid == presented or c.get("type") == "point":
                 continue
             o = objs[oid]
             nw, nh, left, top = _gentle_rect(o, t - c["t"], t, H)
@@ -838,7 +902,7 @@ def _compose_frame(t, base, objs, by_obj, focus_seq, W, H):
         if presented is not None:
             o = objs[presented]
             if superseded:
-                # Hero crossfades out from its lifted position as the next card arrives.
+                # Hero crossfades out from its lifted position as the next item arrives.
                 op = 1.0 - _clamp((t - cur["t"]) / V_FADE, 0.0, 1.0)
                 if op > 0.01:
                     nw, nh, left, top = _hero_rect(o, pres_elapsed, t, W, H)
@@ -850,13 +914,63 @@ def _compose_frame(t, base, objs, by_obj, focus_seq, W, H):
                 _paste_card(frame, o["img"].resize((nw, nh)), left, top, fade(pres_cue),
                             shadow=0.5, shadow_blur=int(max(8, nh * 0.05)), shadow_dy=int(max(6, nh * 0.045)))
 
-    # Floating pointer + brief annotation callout (audio-driven via focus_seq).
+    # Floating pointer + brief annotation callout (audio-driven via focus_seq); the
+    # arrow visits each item exactly as it is named.
     anchor = _draw_pointer(frame, focus_seq, objs, by_obj, t, W, H)
     if cur and anchor:
         label = objs.get(cur["object_id"], {}).get("label", "")
         _draw_annotation(frame, label, anchor, t, cur["t"], W, H)
 
     return _ambient(frame, t, W, H).convert("RGB")
+
+
+def _draw_section_spotlight(frame, base, sec, elapsed, W, H):
+    """Re-brighten the active section over the dimmed base (a soft rounded window)
+    and frame it, so the viewer always knows which chunk is being taught."""
+    from PIL import ImageDraw
+    pad = int(min(W, H) * 0.012)
+    x1 = max(0, sec["left"] - pad)
+    y1 = max(0, sec["top"] - pad)
+    x2 = min(W, sec["left"] + sec["w"] + pad)
+    y2 = min(H, sec["top"] + sec["h"] + pad)
+    w, h = x2 - x1, y2 - y1
+    if w <= 1 or h <= 1:
+        return
+    fade = _ease_out(_clamp(elapsed / 0.45, 0.0, 1.0))
+    rad = int(_clamp(min(w, h) * 0.04, 10, 40))
+
+    win = base.convert("RGBA").crop((x1, y1, x2, y2))
+    win.putalpha(_rounded_mask(w, h, rad))
+    frame.alpha_composite(_with_opacity(win, fade), (x1, y1))
+
+    layer = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    ImageDraw.Draw(layer).rounded_rectangle(
+        [x1, y1, x2 - 1, y2 - 1], radius=rad,
+        outline=V_ACCENT + (255,), width=max(2, int(min(W, H) * 0.0035)))
+    frame.alpha_composite(_with_opacity(layer, fade * 0.85))
+
+    _draw_section_label(frame, sec["label"], x1, y1, fade, W, H)
+
+
+def _draw_section_label(frame, text, x, y, op, W, H):
+    text = (text or "").strip()
+    if not text:
+        return
+    from PIL import ImageDraw
+    fs = int(_clamp(min(W, H) * 0.026, 14, 34))
+    fnt = _font(fs, bold=True)
+    layer = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    tb = d.textbbox((0, 0), text, font=fnt)
+    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+    padx, pady = int(fs * 0.6), int(fs * 0.4)
+    pw, ph = tw + padx * 2, th + pady * 2
+    px = int(_clamp(x, 6, W - pw - 6))
+    py = int(_clamp(y - ph - int(fs * 0.3), 6, H - ph - 6))
+    d.rounded_rectangle([px, py, px + pw, py + ph], radius=int(ph / 2), fill=V_INK + (230,))
+    d.rounded_rectangle([px, py, px + pw, py + ph], radius=int(ph / 2), outline=V_ACCENT + (130,), width=2)
+    d.text((px + padx, py + pady - tb[1]), text, font=fnt, fill=(248, 249, 252, 255))
+    frame.alpha_composite(_with_opacity(layer, op))
 
 
 def _ambient(frame, t, W, H):
@@ -879,13 +993,15 @@ def _ambient(frame, t, W, H):
 _MP = {}
 
 
-def _mp_init(base, objs, by_obj, focus_seq, W, H, frames_dir):
-    _MP.update(base=base, objs=objs, by_obj=by_obj, focus_seq=focus_seq, W=W, H=H, dir=frames_dir)
+def _mp_init(base, objs, by_obj, focus_seq, sections, section_timeline, W, H, frames_dir):
+    _MP.update(base=base, objs=objs, by_obj=by_obj, focus_seq=focus_seq,
+               sections=sections, section_timeline=section_timeline, W=W, H=H, dir=frames_dir)
 
 
 def _mp_frame(args):
     fi, t = args
-    _compose_frame(t, _MP["base"], _MP["objs"], _MP["by_obj"], _MP["focus_seq"], _MP["W"], _MP["H"]).save(
+    _compose_frame(t, _MP["base"], _MP["objs"], _MP["by_obj"], _MP["focus_seq"],
+                   _MP["sections"], _MP["section_timeline"], _MP["W"], _MP["H"]).save(
         os.path.join(_MP["dir"], f"f{fi:05d}.png"))
 
 
@@ -918,6 +1034,8 @@ def render_narration_video(scene, fps=24):
         total = acc if acc > 0 else 1.0
 
         by_obj, focus_seq = _build_cues(scene, offsets, total)
+        sections = _build_sections(scene, W, H)
+        section_timeline = _build_section_timeline(focus_seq, sections)
 
         nframes = max(1, int(math.ceil(total * fps)))
         frames_dir = os.path.join(work, "frames")
@@ -927,10 +1045,10 @@ def render_narration_video(scene, fps=24):
         if nproc > 1 and nframes > 8:
             import multiprocessing as mp
             with mp.Pool(processes=nproc, initializer=_mp_init,
-                         initargs=(base, objs, by_obj, focus_seq, W, H, frames_dir)) as pool:
+                         initargs=(base, objs, by_obj, focus_seq, sections, section_timeline, W, H, frames_dir)) as pool:
                 pool.map(_mp_frame, frame_args, chunksize=4)
         else:
-            _mp_init(base, objs, by_obj, focus_seq, W, H, frames_dir)
+            _mp_init(base, objs, by_obj, focus_seq, sections, section_timeline, W, H, frames_dir)
             for a in frame_args:
                 _mp_frame(a)
 
