@@ -398,8 +398,15 @@ V_RAISE_FILL = 0.62             # hero card target fill of the stage
 V_RAISE_MIN, V_RAISE_MAX = 0.5, 2.6
 V_DIM_GENTLE = 0.72            # base dim while a card is gently highlighted
 V_DIM_HERO = 0.26              # base dim under a hero lift
-V_DIM_SECTION = 0.4           # base dim outside the current section's spotlight
-V_AMBIENT = 0.02              # slow ambient breath/pan so frames are never static
+V_DIM_SECTION = 0.4           # (unused) legacy blanket-spotlight dim
+V_AMBIENT = 0.02              # (unused) legacy ambient breath
+# Camera: the diagram sits zoomed-out with a background margin; the camera eases
+# INTO a section only when it is a tight, contiguous block (then a dotted outline
+# frames it). No whole-frame breathing — the frame stays stable.
+V_MARGIN = 0.06              # background margin around the diagram (zoomed-out default)
+V_SECTION_FILL = 0.78        # fraction of the frame a zoomed-in section fills
+V_ZOOM_DUR = 0.9             # camera ease between framings (seconds)
+V_TIGHT_MIN = 0.4            # min item-area / section-area to count as a tight block
 
 
 def _ffmpeg_exe():
@@ -662,11 +669,19 @@ def _active_state(t, by_obj):
     return active, presented, pres_cue
 
 
-# ── Card geometry over time ──────────────────────────────────────────────────
-def _gentle_rect(o, elapsed, t, H):
+# ── Camera + card geometry ───────────────────────────────────────────────────
+# The diagram is composed onto a "stage" at its own coordinates, then a viewport
+# CAMERA maps the stage to the output frame: zoomed OUT with a background margin by
+# default (so the whole diagram is visible with breathing room), and eased INTO the
+# current pedagogical section when that section is a tight, contiguous block. The
+# arrow + pills + dotted section outline are drawn crisply in OUTPUT space.
+
+def _lift_rect(o, elapsed, t, H, strong=False):
+    """An in-place lift of a card off the page (no fly-to-centre)."""
+    amt = 0.2 if strong else V_GENTLE_SCALE
     p = _ease_out(_clamp(elapsed / V_SETTLE, 0.0, 1.0))
-    scale = 1.0 + V_GENTLE_SCALE * p
-    rise = (V_GENTLE_RISE * H) * p
+    scale = 1.0 + amt * p
+    rise = (V_GENTLE_RISE * (1.7 if strong else 1.0) * H) * p
     bob = math.sin(t * 1.5) * (H * 0.0035) * p
     nw = max(1, int(round(o["w"] * scale)))
     nh = max(1, int(round(o["h"] * scale)))
@@ -675,20 +690,111 @@ def _gentle_rect(o, elapsed, t, H):
     return nw, nh, int(round(cx - nw / 2)), int(round(cy - nh / 2))
 
 
-def _hero_rect(o, elapsed, t, W, H):
-    gw, gh = o["w"] / W, o["h"] / H
-    target = _clamp(min(V_RAISE_FILL / gw, V_RAISE_FILL / gh), V_RAISE_MIN, V_RAISE_MAX)
-    lp = _ease_out_back(_clamp((elapsed - V_BORDER_DUR) / V_LIFT_DUR, 0.0, 1.0))
-    scale = 1.0 + (target - 1.0) * lp
-    start_cx, start_cy = o["left"] + o["w"] / 2, o["top"] + o["h"] / 2
-    settled = max(0.0, elapsed - (V_BORDER_DUR + V_LIFT_DUR))
-    bob = math.sin(settled * 1.4) * (H * 0.01)
-    end_cx, end_cy = W / 2, H * 0.54 + bob
-    cx = start_cx + (end_cx - start_cx) * lp
-    cy = start_cy + (end_cy - start_cy) * lp
-    nw = max(1, int(round(o["w"] * scale)))
-    nh = max(1, int(round(o["h"] * scale)))
-    return nw, nh, int(round(cx - nw / 2)), int(round(cy - nh / 2))
+def _bg_color(base):
+    """The diagram's background colour, sampled from its border (for the margin)."""
+    im = base.convert("RGB")
+    w, h = im.size
+    small = im.resize((min(w, 64), min(h, 64)))
+    sw, sh = small.size
+    px = small.load()
+    border = []
+    for x in range(sw):
+        border.append(px[x, 0]); border.append(px[x, sh - 1])
+    for y in range(sh):
+        border.append(px[0, y]); border.append(px[sw - 1, y])
+    border.sort(key=lambda c: c[0] + c[1] + c[2])
+    return border[len(border) // 2]
+
+
+def _default_viewport(W, H):
+    vw = W / (1.0 - 2.0 * V_MARGIN)
+    vh = H / (1.0 - 2.0 * V_MARGIN)
+    return (-(vw - W) / 2.0, -(vh - H) / 2.0, vw, vh)
+
+
+def _fit_viewport(rect, W, H, fill):
+    rx, ry, rw, rh = rect
+    ar = W / H
+    vw = max(rw / fill, (rh / fill) * ar)
+    vh = vw / ar
+    cx, cy = rx + rw / 2.0, ry + rh / 2.0
+    return (cx - vw / 2.0, cy - vh / 2.0, vw, vh)
+
+
+def _section_tight(sec, objs):
+    """A section is tight enough to zoom + outline only if its items fill a decent
+    fraction of its bounding box (i.e. it is a contiguous block, not scattered)."""
+    area = sec["w"] * sec["h"]
+    if area <= 1:
+        return False
+    used = 0.0
+    for oid in sec["item_ids"]:
+        o = objs.get(oid)
+        if o:
+            used += o["w"] * o["h"]
+    return (used / area) >= V_TIGHT_MIN
+
+
+def _build_cam_runs(section_timeline, sections, objs, W, H):
+    runs = [{"t": 0.0, "rect": None}]
+    for run in section_timeline:
+        sec = sections.get(run["section_id"])
+        rect = None
+        if sec and _section_tight(sec, objs):
+            rect = (sec["left"], sec["top"], sec["w"], sec["h"])
+        runs.append({"t": run["t"], "rect": rect})
+    return runs
+
+
+def _camera(t, cam_runs, W, H):
+    cur, prev = None, None
+    for r in cam_runs:
+        if r["t"] <= t + 1e-6:
+            prev, cur = cur, r
+        else:
+            break
+
+    def vp_of(run):
+        if run is None or run["rect"] is None:
+            return _default_viewport(W, H)
+        return _fit_viewport(run["rect"], W, H, V_SECTION_FILL)
+
+    cvp = vp_of(cur)
+    if prev is None:
+        return cvp
+    pvp = vp_of(prev)
+    p = _ease_in_out(_clamp((t - cur["t"]) / V_ZOOM_DUR, 0.0, 1.0))
+    return tuple(pvp[i] + (cvp[i] - pvp[i]) * p for i in range(4))
+
+
+def _apply_viewport(stage, vp, bg, W, H):
+    vx, vy, vw, vh = vp
+    iw, ih = max(1, int(round(vw))), max(1, int(round(vh)))
+    canvas = Image.new("RGBA", (iw, ih), tuple(bg) + (255,))
+    canvas.alpha_composite(stage, (int(round(-vx)), int(round(-vy))))
+    return canvas.resize((W, H))
+
+
+def _vp_map(sx, sy, vp, W, H):
+    vx, vy, vw, vh = vp
+    return ((sx - vx) / vw * W, (sy - vy) / vh * H)
+
+
+def _draw_dotted_rect(d, x1, y1, x2, y2, color, width, dash, gap):
+    def dline(xa, ya, xb, yb):
+        L = math.hypot(xb - xa, yb - ya)
+        if L < 1:
+            return
+        ux, uy = (xb - xa) / L, (yb - ya) / L
+        pos = 0.0
+        while pos < L:
+            a, bb = pos, min(L, pos + dash)
+            d.line([(xa + ux * a, ya + uy * a), (xa + ux * bb, ya + uy * bb)], fill=color, width=width)
+            pos += dash + gap
+    dline(x1, y1, x2, y1)
+    dline(x2, y1, x2, y2)
+    dline(x2, y2, x1, y2)
+    dline(x1, y2, x1, y1)
 
 
 # ── Floating 3D pointer ──────────────────────────────────────────────────────
@@ -746,7 +852,6 @@ def _arrow_img(size):
     out.alpha_composite(outline)
     out.alpha_composite(body)
     out.alpha_composite(specL)
-    # tip offset from the image's top-left (used to anchor the tip on target).
     meta = {"tip": (canvas[0] / 2, oy + Hd), "size": canvas}
     _ARROW_CACHE[size] = (out, meta)
     return _ARROW_CACHE[size]
@@ -762,50 +867,54 @@ def _focus_at(t, focus_seq):
     return cur, prev
 
 
-def _target_top_center(oid, objs, by_obj, t, W, H):
-    """Where the pointer should aim: the top-centre of the object's card NOW."""
+def _target_top_center(oid, objs, by_obj, t, H):
+    """Where the pointer aims, in STAGE coords: the top-centre of the item (its
+    lifted card top for border/raise, else its plain bbox top)."""
     o = objs.get(oid)
     if not o:
-        return (W / 2, H * 0.2)
+        return None
     cue = None
     for c in by_obj.get(oid, []):
         if c["t"] <= t + 1e-6:
             cue = c
         else:
             break
-    e = (t - cue["t"]) if cue else 0.0
-    if cue and cue["type"] == "raise" and e >= V_BORDER_DUR:
-        nw, nh, left, top = _hero_rect(o, e, t, W, H)
-    else:
-        nw, nh, left, top = _gentle_rect(o, e, t, H)
-    return (left + nw / 2, top)
+    if cue and cue["type"] in ("border", "raise"):
+        e = t - cue["t"]
+        nw, nh, left, top = _lift_rect(o, e, t, H, strong=(cue["type"] == "raise"))
+        return (left + nw / 2, top)
+    return (o["left"] + o["w"] / 2, o["top"])
 
 
-def _draw_pointer(frame, focus_seq, objs, by_obj, t, W, H):
+def _draw_pointer(out, focus_seq, objs, by_obj, t, vp, W, H):
     cur, prev = _focus_at(t, focus_seq)
     if not cur:
         return None
-    arrow, meta = _arrow_img(int(_clamp(min(W, H) * 0.058, 34, 112)))
-    aw, ah = meta["size"]
+    arrow, meta = _arrow_img(int(_clamp(min(W, H) * 0.055, 32, 104)))
     tipx_off, tipy_off = meta["tip"]
+    aw, ah = meta["size"]
 
-    cur_pt = _target_top_center(cur["object_id"], objs, by_obj, t, W, H)
+    cur_s = _target_top_center(cur["object_id"], objs, by_obj, t, H)
+    if cur_s is None:
+        return None
+    cur_pt = _vp_map(cur_s[0], cur_s[1], vp, W, H)
     if prev:
-        prev_pt = _target_top_center(prev["object_id"], objs, by_obj, t, W, H)
+        prev_s = _target_top_center(prev["object_id"], objs, by_obj, t, H)
+        prev_pt = _vp_map(prev_s[0], prev_s[1], vp, W, H) if prev_s else cur_pt
         gp = _ease_in_out(_clamp((t - cur["t"]) / V_GLIDE, 0.0, 1.0))
     else:
         prev_pt, gp = cur_pt, 1.0
 
     tip_x = prev_pt[0] + (cur_pt[0] - prev_pt[0]) * gp
     tip_y = prev_pt[1] + (cur_pt[1] - prev_pt[1]) * gp
-    gap = ah * 0.10 + math.sin(t * 2.3) * (ah * 0.05)   # hover above + idle bob
+    gap = ah * 0.10 + math.sin(t * 2.3) * (ah * 0.05)
     tip_y -= gap
 
     left = int(round(tip_x - tipx_off))
     top = int(round(tip_y - tipy_off))
     op = _clamp((t - cur["t"]) / 0.3, 0.0, 1.0) if not prev else 1.0
-    frame.alpha_composite(_with_opacity(arrow, op), (left, top))
-    return (tip_x, top)   # anchor for the annotation (arrow body top)
+    out.alpha_composite(_with_opacity(arrow, op), (left, top))
+    return (tip_x, top)
 
 
 def _draw_annotation(frame, text, anchor, t, t0, W, H):
@@ -848,116 +957,12 @@ def _draw_annotation(frame, text, anchor, t, t0, W, H):
     frame.alpha_composite(_with_opacity(layer, op))
 
 
-def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline, W, H):
-    from PIL import ImageFilter
-    active, presented, pres_cue = _active_state(t, by_obj)
-    cur, _prev = _focus_at(t, focus_seq)
-
-    # A hero (raise) holds centre-stage, but must YIELD as soon as a newer focus
-    # begins — otherwise it lingers while the pointer has already moved on. When
-    # superseded it cross-fades out over V_FADE instead of cutting.
-    superseded = (presented is not None and cur is not None
-                  and cur["object_id"] != presented and cur["t"] > pres_cue["t"] + 1e-6)
-    pres_elapsed = (t - pres_cue["t"]) if pres_cue else 0.0
-    hero = presented is not None and pres_elapsed >= V_BORDER_DUR and not superseded
-
-    # The current pedagogical SECTION (drives the spotlight + signpost label),
-    # unless a hero lift takes the whole stage.
-    sec_run = _active_section(t, section_timeline) if sections else None
-    sec = sections.get(sec_run["section_id"]) if sec_run else None
-    spotlight = sec is not None and not hero
-
-    if hero:
-        frame = _brightness(base.convert("RGBA").filter(ImageFilter.GaussianBlur(2)), V_DIM_HERO)
-    elif spotlight:
-        frame = _brightness(base.convert("RGBA"), V_DIM_SECTION)
-    elif active:
-        frame = _brightness(base.convert("RGBA"), V_DIM_GENTLE)
-    else:
-        frame = base.convert("RGBA").copy()
-
-    # Re-brighten the active section as a spotlight window + show its label.
-    if spotlight:
-        _draw_section_spotlight(frame, base, sec, t - sec_run["t"], W, H)
-
-    def fade(c):
-        return _clamp((t - c["t"]) / V_FADE, 0.0, 1.0) if V_FADE > 0 else 1.0
-
-    if hero:
-        # Sole focus: the one card centre-stage.
-        o = objs[presented]
-        nw, nh, left, top = _hero_rect(o, pres_elapsed, t, W, H)
-        _paste_card(frame, o["img"].resize((nw, nh)), left, top, fade(pres_cue),
-                    shadow=0.62, shadow_blur=int(max(16, nh * 0.06)), shadow_dy=int(H * 0.05))
-    else:
-        # Active items: point = arrow only (the item already sits bright in the
-        # spotlight); border = gentle in-place lift card.
-        for oid, c in active.items():
-            if oid == presented or c.get("type") == "point":
-                continue
-            o = objs[oid]
-            nw, nh, left, top = _gentle_rect(o, t - c["t"], t, H)
-            _paste_card(frame, o["img"].resize((nw, nh)), left, top, fade(c),
-                        shadow=0.55, shadow_blur=int(max(10, nh * 0.06)), shadow_dy=int(max(8, nh * 0.06)))
-        if presented is not None:
-            o = objs[presented]
-            if superseded:
-                # Hero crossfades out from its lifted position as the next item arrives.
-                op = 1.0 - _clamp((t - cur["t"]) / V_FADE, 0.0, 1.0)
-                if op > 0.01:
-                    nw, nh, left, top = _hero_rect(o, pres_elapsed, t, W, H)
-                    _paste_card(frame, o["img"].resize((nw, nh)), left, top, op,
-                                shadow=0.62, shadow_blur=int(max(16, nh * 0.06)), shadow_dy=int(H * 0.05))
-            else:
-                # Brief in-place beat before the lift to centre.
-                nw, nh, left, top = _gentle_rect(o, pres_elapsed, t, H)
-                _paste_card(frame, o["img"].resize((nw, nh)), left, top, fade(pres_cue),
-                            shadow=0.5, shadow_blur=int(max(8, nh * 0.05)), shadow_dy=int(max(6, nh * 0.045)))
-
-    # Floating pointer + brief annotation callout (audio-driven via focus_seq); the
-    # arrow visits each item exactly as it is named.
-    anchor = _draw_pointer(frame, focus_seq, objs, by_obj, t, W, H)
-    if cur and anchor:
-        label = objs.get(cur["object_id"], {}).get("label", "")
-        _draw_annotation(frame, label, anchor, t, cur["t"], W, H)
-
-    return _ambient(frame, t, W, H).convert("RGB")
-
-
-def _draw_section_spotlight(frame, base, sec, elapsed, W, H):
-    """Re-brighten the active section over the dimmed base (a soft rounded window)
-    and frame it, so the viewer always knows which chunk is being taught."""
-    from PIL import ImageDraw
-    pad = int(min(W, H) * 0.012)
-    x1 = max(0, sec["left"] - pad)
-    y1 = max(0, sec["top"] - pad)
-    x2 = min(W, sec["left"] + sec["w"] + pad)
-    y2 = min(H, sec["top"] + sec["h"] + pad)
-    w, h = x2 - x1, y2 - y1
-    if w <= 1 or h <= 1:
-        return
-    fade = _ease_out(_clamp(elapsed / 0.45, 0.0, 1.0))
-    rad = int(_clamp(min(w, h) * 0.04, 10, 40))
-
-    win = base.convert("RGBA").crop((x1, y1, x2, y2))
-    win.putalpha(_rounded_mask(w, h, rad))
-    frame.alpha_composite(_with_opacity(win, fade), (x1, y1))
-
-    layer = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-    ImageDraw.Draw(layer).rounded_rectangle(
-        [x1, y1, x2 - 1, y2 - 1], radius=rad,
-        outline=V_ACCENT + (255,), width=max(2, int(min(W, H) * 0.0035)))
-    frame.alpha_composite(_with_opacity(layer, fade * 0.85))
-
-    _draw_section_label(frame, sec["label"], x1, y1, fade, W, H)
-
-
 def _draw_section_label(frame, text, x, y, op, W, H):
     text = (text or "").strip()
     if not text:
         return
     from PIL import ImageDraw
-    fs = int(_clamp(min(W, H) * 0.026, 14, 34))
+    fs = int(_clamp(min(W, H) * 0.028, 15, 36))
     fnt = _font(fs, bold=True)
     layer = Image.new("RGBA", frame.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
@@ -966,25 +971,72 @@ def _draw_section_label(frame, text, x, y, op, W, H):
     padx, pady = int(fs * 0.6), int(fs * 0.4)
     pw, ph = tw + padx * 2, th + pady * 2
     px = int(_clamp(x, 6, W - pw - 6))
-    py = int(_clamp(y - ph - int(fs * 0.3), 6, H - ph - 6))
-    d.rounded_rectangle([px, py, px + pw, py + ph], radius=int(ph / 2), fill=V_INK + (230,))
-    d.rounded_rectangle([px, py, px + pw, py + ph], radius=int(ph / 2), outline=V_ACCENT + (130,), width=2)
+    py = int(_clamp(y - ph - int(fs * 0.35), 6, H - ph - 6))
+    d.rounded_rectangle([px, py, px + pw, py + ph], radius=int(ph / 2), fill=V_INK + (235,))
+    d.rounded_rectangle([px, py, px + pw, py + ph], radius=int(ph / 2), outline=V_ACCENT + (150,), width=2)
     d.text((px + padx, py + pady - tb[1]), text, font=fnt, fill=(248, 249, 252, 255))
     frame.alpha_composite(_with_opacity(layer, op))
 
 
-def _ambient(frame, t, W, H):
-    """A very slow breath + drift on the whole composition so the frame is never
-    fully static, without disturbing the object coordinates."""
-    z = V_AMBIENT * (0.5 - 0.5 * math.cos(t * 2 * math.pi / 16.0))
-    if z <= 0.0005:
-        return frame
-    nw, nh = int(round(W * (1 + z))), int(round(H * (1 + z)))
-    big = frame.resize((nw, nh))
-    px = math.sin(t * 2 * math.pi / 37.0) * 0.5 + 0.5
-    py = math.cos(t * 2 * math.pi / 41.0) * 0.5 + 0.5
-    ox, oy = int((nw - W) * px), int((nh - H) * py)
-    return big.crop((ox, oy, ox + W, oy + H))
+def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H):
+    active, presented, pres_cue = _active_state(t, by_obj)
+    cur, _prev = _focus_at(t, focus_seq)
+    superseded = (presented is not None and cur is not None
+                  and cur["object_id"] != presented and cur["t"] > pres_cue["t"] + 1e-6)
+    pres_elapsed = (t - pres_cue["t"]) if pres_cue else 0.0
+    hero = presented is not None and pres_elapsed >= V_BORDER_DUR and not superseded
+
+    def fade(c):
+        return _clamp((t - c["t"]) / V_FADE, 0.0, 1.0) if V_FADE > 0 else 1.0
+
+    # STAGE (diagram coords): base + in-place lifted cards. point items get no card
+    # (the arrow alone follows them); border = gentle lift; the core raise = a
+    # stronger in-place lift. No blanket dim — the camera + arrow provide the focus.
+    stage = base.convert("RGBA").copy()
+    for oid, c in active.items():
+        if c.get("type") == "point":
+            continue
+        if oid == presented:
+            strong = hero or superseded
+            op = (1.0 - _clamp((t - cur["t"]) / V_FADE, 0.0, 1.0)) if superseded else fade(pres_cue)
+            if op <= 0.01:
+                continue
+            nw, nh, left, top = _lift_rect(objs[oid], pres_elapsed, t, H, strong=strong)
+            _paste_card(stage, objs[oid]["img"].resize((nw, nh)), left, top, op,
+                        shadow=0.6 if strong else 0.5, shadow_blur=int(max(12, nh * 0.06)), shadow_dy=int(max(8, nh * 0.05)))
+        else:
+            nw, nh, left, top = _lift_rect(objs[oid], t - c["t"], t, H, strong=(c.get("type") == "border"))
+            _paste_card(stage, objs[oid]["img"].resize((nw, nh)), left, top, fade(c),
+                        shadow=0.5, shadow_blur=int(max(10, nh * 0.06)), shadow_dy=int(max(8, nh * 0.05)))
+
+    # CAMERA: zoomed out with margin by default; eased into the current tight section.
+    vp = _camera(t, cam_runs, W, H)
+    out = _apply_viewport(stage, vp, bg, W, H)
+
+    # Dotted outline + label around the current section (only when it is a tight,
+    # contiguous block — never a blanket over scattered content).
+    sec_run = _active_section(t, section_timeline) if sections else None
+    sec = sections.get(sec_run["section_id"]) if sec_run else None
+    if sec and _section_tight(sec, objs):
+        from PIL import ImageDraw
+        op = _ease_out(_clamp((t - sec_run["t"]) / 0.5, 0.0, 1.0))
+        x1, y1 = _vp_map(sec["left"], sec["top"], vp, W, H)
+        x2, y2 = _vp_map(sec["left"] + sec["w"], sec["top"] + sec["h"], vp, W, H)
+        pad = min(W, H) * 0.016
+        x1 -= pad; y1 -= pad; x2 += pad; y2 += pad
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        _draw_dotted_rect(ImageDraw.Draw(layer), x1, y1, x2, y2, V_ACCENT + (255,),
+                          max(2, int(min(W, H) * 0.004)), int(min(W, H) * 0.02), int(min(W, H) * 0.013))
+        out.alpha_composite(_with_opacity(layer, op * 0.95))
+        _draw_section_label(out, sec["label"], x1, y1, op, W, H)
+
+    # Pointer + brief annotation (output space); the arrow visits each named item.
+    anchor = _draw_pointer(out, focus_seq, objs, by_obj, t, vp, W, H)
+    if cur and anchor:
+        _draw_annotation(out, objs.get(cur["object_id"], {}).get("label", ""), anchor, t, cur["t"], W, H)
+
+    return out.convert("RGB")
+
 
 
 
@@ -993,15 +1045,17 @@ def _ambient(frame, t, W, H):
 _MP = {}
 
 
-def _mp_init(base, objs, by_obj, focus_seq, sections, section_timeline, W, H, frames_dir):
+def _mp_init(base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H, frames_dir):
     _MP.update(base=base, objs=objs, by_obj=by_obj, focus_seq=focus_seq,
-               sections=sections, section_timeline=section_timeline, W=W, H=H, dir=frames_dir)
+               sections=sections, section_timeline=section_timeline,
+               cam_runs=cam_runs, bg=bg, W=W, H=H, dir=frames_dir)
 
 
 def _mp_frame(args):
     fi, t = args
     _compose_frame(t, _MP["base"], _MP["objs"], _MP["by_obj"], _MP["focus_seq"],
-                   _MP["sections"], _MP["section_timeline"], _MP["W"], _MP["H"]).save(
+                   _MP["sections"], _MP["section_timeline"], _MP["cam_runs"], _MP["bg"],
+                   _MP["W"], _MP["H"]).save(
         os.path.join(_MP["dir"], f"f{fi:05d}.png"))
 
 
@@ -1036,6 +1090,8 @@ def render_narration_video(scene, fps=24):
         by_obj, focus_seq = _build_cues(scene, offsets, total)
         sections = _build_sections(scene, W, H)
         section_timeline = _build_section_timeline(focus_seq, sections)
+        cam_runs = _build_cam_runs(section_timeline, sections, objs, W, H)
+        bg = _bg_color(base)
 
         nframes = max(1, int(math.ceil(total * fps)))
         frames_dir = os.path.join(work, "frames")
@@ -1045,10 +1101,10 @@ def render_narration_video(scene, fps=24):
         if nproc > 1 and nframes > 8:
             import multiprocessing as mp
             with mp.Pool(processes=nproc, initializer=_mp_init,
-                         initargs=(base, objs, by_obj, focus_seq, sections, section_timeline, W, H, frames_dir)) as pool:
+                         initargs=(base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H, frames_dir)) as pool:
                 pool.map(_mp_frame, frame_args, chunksize=4)
         else:
-            _mp_init(base, objs, by_obj, focus_seq, sections, section_timeline, W, H, frames_dir)
+            _mp_init(base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H, frames_dir)
             for a in frame_args:
                 _mp_frame(a)
 
