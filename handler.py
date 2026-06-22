@@ -403,10 +403,13 @@ V_AMBIENT = 0.02              # (unused) legacy ambient breath
 # Camera: the diagram sits zoomed-out with a background margin; the camera eases
 # INTO a section only when it is a tight, contiguous block (then a dotted outline
 # frames it). No whole-frame breathing — the frame stays stable.
-V_MARGIN = 0.06              # background margin around the diagram (zoomed-out default)
-V_SECTION_FILL = 0.78        # fraction of the frame a zoomed-in section fills
+V_MARGIN = 0.11             # background margin around the diagram (zoomed-out default)
+V_SECTION_FILL = 0.8         # fraction of the frame a zoomed-in section fills
 V_ZOOM_DUR = 0.9             # camera ease between framings (seconds)
 V_TIGHT_MIN = 0.4            # min item-area / section-area to count as a tight block
+V_SECTION_HOLD = 2.6        # how long the camera holds a section zoom before pulling back out
+V_DASH_SPEED = 0.06         # marching-ants speed of the dotted outline (fraction of min side / s)
+V_FLASH_DUR = 0.5           # brief flash pulse on each item as it is named
 
 
 def _ffmpeg_exe():
@@ -736,13 +739,17 @@ def _section_tight(sec, objs):
 
 
 def _build_cam_runs(section_timeline, sections, objs, W, H):
+    """Punch INTO a tight section briefly at its start, then pull back OUT so the
+    whole diagram is visible again while the arrow walks the section's items."""
     runs = [{"t": 0.0, "rect": None}]
     for run in section_timeline:
         sec = sections.get(run["section_id"])
-        rect = None
         if sec and _section_tight(sec, objs):
             rect = (sec["left"], sec["top"], sec["w"], sec["h"])
-        runs.append({"t": run["t"], "rect": rect})
+            runs.append({"t": run["t"], "rect": rect})                       # zoom in
+            runs.append({"t": run["t"] + V_SECTION_HOLD, "rect": None})      # pull back out
+        else:
+            runs.append({"t": run["t"], "rect": None})
     return runs
 
 
@@ -780,17 +787,22 @@ def _vp_map(sx, sy, vp, W, H):
     return ((sx - vx) / vw * W, (sy - vy) / vh * H)
 
 
-def _draw_dotted_rect(d, x1, y1, x2, y2, color, width, dash, gap):
+def _draw_dotted_rect(d, x1, y1, x2, y2, color, width, dash, gap, phase=0.0):
+    """A dashed rectangle whose dashes MARCH (offset by `phase`) so it animates."""
+    period = dash + gap
+    ph = phase % period
+
     def dline(xa, ya, xb, yb):
         L = math.hypot(xb - xa, yb - ya)
         if L < 1:
             return
         ux, uy = (xb - xa) / L, (yb - ya) / L
-        pos = 0.0
+        pos = -ph
         while pos < L:
-            a, bb = pos, min(L, pos + dash)
-            d.line([(xa + ux * a, ya + uy * a), (xa + ux * bb, ya + uy * bb)], fill=color, width=width)
-            pos += dash + gap
+            a, bb = max(0.0, pos), min(L, pos + dash)
+            if bb > a:
+                d.line([(xa + ux * a, ya + uy * a), (xa + ux * bb, ya + uy * bb)], fill=color, width=width)
+            pos += period
     dline(x1, y1, x2, y1)
     dline(x2, y1, x2, y2)
     dline(x2, y2, x1, y2)
@@ -917,7 +929,11 @@ def _draw_pointer(out, focus_seq, objs, by_obj, t, vp, W, H):
     return (tip_x, top)
 
 
-def _draw_annotation(frame, text, anchor, t, t0, W, H):
+def _rects_overlap(a, b):
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+def _draw_annotation(frame, text, anchor, t, t0, W, H, avoid=None):
     e = t - t0
     if e < 0:
         return
@@ -947,8 +963,12 @@ def _draw_annotation(frame, text, anchor, t, t0, W, H):
     anchor_x, arrow_top = anchor
     x0 = int(_clamp(anchor_x - pillw / 2, 8, W - pillw - 8))
     y0 = int(arrow_top - pillh - int(fs * 0.45))
+    below_y = int(_clamp(arrow_top + int(fs * 1.6), 8, H - pillh - 8))
     if y0 < 8:
-        y0 = int(_clamp(arrow_top + int(fs * 0.45), 8, H - pillh - 8))
+        y0 = below_y
+    # Never collide with the fixed section-label pill — drop below the arrow instead.
+    if avoid is not None and _rects_overlap((x0, y0, x0 + pillw, y0 + pillh), avoid):
+        y0 = below_y
     d.rounded_rectangle([x0, y0, x0 + pillw, y0 + pillh], radius=int(pillh / 2), fill=V_INK + (236,))
     d.rounded_rectangle([x0, y0, x0 + pillw, y0 + pillh], radius=int(pillh / 2), outline=V_ACCENT + (90,), width=2)
     cy = y0 + pillh / 2
@@ -957,25 +977,32 @@ def _draw_annotation(frame, text, anchor, t, t0, W, H):
     frame.alpha_composite(_with_opacity(layer, op))
 
 
-def _draw_section_label(frame, text, x, y, op, W, H):
+def _draw_section_label(frame, text, op, W, H):
+    """A fixed 'chapter' pill at the top-left (a stable signpost that never moves
+    around or collides with the per-item annotation). Returns its bounding rect."""
     text = (text or "").strip()
     if not text:
-        return
+        return None
     from PIL import ImageDraw
-    fs = int(_clamp(min(W, H) * 0.028, 15, 36))
+    fs = int(_clamp(min(W, H) * 0.03, 16, 38))
     fnt = _font(fs, bold=True)
     layer = Image.new("RGBA", frame.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
     tb = d.textbbox((0, 0), text, font=fnt)
     tw, th = tb[2] - tb[0], tb[3] - tb[1]
-    padx, pady = int(fs * 0.6), int(fs * 0.4)
-    pw, ph = tw + padx * 2, th + pady * 2
-    px = int(_clamp(x, 6, W - pw - 6))
-    py = int(_clamp(y - ph - int(fs * 0.35), 6, H - ph - 6))
-    d.rounded_rectangle([px, py, px + pw, py + ph], radius=int(ph / 2), fill=V_INK + (235,))
-    d.rounded_rectangle([px, py, px + pw, py + ph], radius=int(ph / 2), outline=V_ACCENT + (150,), width=2)
-    d.text((px + padx, py + pady - tb[1]), text, font=fnt, fill=(248, 249, 252, 255))
+    dot = int(fs * 0.4)
+    padx, pady = int(fs * 0.6), int(fs * 0.42)
+    gap = int(fs * 0.4)
+    pw, ph = padx + dot + gap + tw + padx, th + pady * 2
+    m = int(min(W, H) * 0.03)
+    px, py = m, m
+    d.rounded_rectangle([px, py, px + pw, py + ph], radius=int(ph / 2), fill=V_INK + (238,))
+    d.rounded_rectangle([px, py, px + pw, py + ph], radius=int(ph / 2), outline=V_ACCENT + (170,), width=2)
+    cy = py + ph / 2
+    d.ellipse([px + padx, cy - dot / 2, px + padx + dot, cy + dot / 2], fill=V_ACCENT + (255,))
+    d.text((px + padx + dot + gap, py + pady - tb[1]), text, font=fnt, fill=(248, 249, 252, 255))
     frame.alpha_composite(_with_opacity(layer, op))
+    return (px, py, px + pw, py + ph)
 
 
 def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H):
@@ -1009,31 +1036,50 @@ def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline,
             _paste_card(stage, objs[oid]["img"].resize((nw, nh)), left, top, fade(c),
                         shadow=0.5, shadow_blur=int(max(10, nh * 0.06)), shadow_dy=int(max(8, nh * 0.05)))
 
-    # CAMERA: zoomed out with margin by default; eased into the current tight section.
+    # FLASH the current point-item as it is named (lift is the animation for
+    # border/raise; flashing gives the lighter point items their own punctuation).
+    if cur and cur.get("type") not in ("border", "raise"):
+        fe = t - cur["t"]
+        if 0.0 <= fe < V_FLASH_DUR:
+            o = objs.get(cur["object_id"])
+            if o:
+                pulse = math.sin(fe / V_FLASH_DUR * math.pi)
+                stage.alpha_composite(
+                    _with_opacity(_brightness(o["img"], 1.0 + 0.7 * pulse), 0.5 * pulse),
+                    (o["left"], o["top"]))
+
+    # CAMERA: zoomed out with margin by default; eased into the current tight
+    # section briefly, then back out so the whole diagram is visible again.
     vp = _camera(t, cam_runs, W, H)
     out = _apply_viewport(stage, vp, bg, W, H)
 
-    # Dotted outline + label around the current section (only when it is a tight,
-    # contiguous block — never a blanket over scattered content).
+    # Animated dotted outline + fixed chapter label for the current section (only a
+    # tight, contiguous block — never a blanket over scattered content). The dashes
+    # MARCH so the outline reads as a moving, attention-drawing frame.
     sec_run = _active_section(t, section_timeline) if sections else None
     sec = sections.get(sec_run["section_id"]) if sec_run else None
+    label_rect = None
     if sec and _section_tight(sec, objs):
         from PIL import ImageDraw
-        op = _ease_out(_clamp((t - sec_run["t"]) / 0.5, 0.0, 1.0))
+        op = _ease_out(_clamp((t - sec_run["t"]) / 0.45, 0.0, 1.0))
         x1, y1 = _vp_map(sec["left"], sec["top"], vp, W, H)
         x2, y2 = _vp_map(sec["left"] + sec["w"], sec["top"] + sec["h"], vp, W, H)
         pad = min(W, H) * 0.016
         x1 -= pad; y1 -= pad; x2 += pad; y2 += pad
         layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        phase = t * V_DASH_SPEED * min(W, H)
         _draw_dotted_rect(ImageDraw.Draw(layer), x1, y1, x2, y2, V_ACCENT + (255,),
-                          max(2, int(min(W, H) * 0.004)), int(min(W, H) * 0.02), int(min(W, H) * 0.013))
+                          max(3, int(min(W, H) * 0.006)), int(min(W, H) * 0.026),
+                          int(min(W, H) * 0.018), phase)
         out.alpha_composite(_with_opacity(layer, op * 0.95))
-        _draw_section_label(out, sec["label"], x1, y1, op, W, H)
+        label_rect = _draw_section_label(out, sec["label"], op, W, H)
 
-    # Pointer + brief annotation (output space); the arrow visits each named item.
+    # Pointer + brief annotation (output space); the arrow visits each named item,
+    # and the annotation never overlaps the fixed chapter label.
     anchor = _draw_pointer(out, focus_seq, objs, by_obj, t, vp, W, H)
     if cur and anchor:
-        _draw_annotation(out, objs.get(cur["object_id"], {}).get("label", ""), anchor, t, cur["t"], W, H)
+        _draw_annotation(out, objs.get(cur["object_id"], {}).get("label", ""),
+                         anchor, t, cur["t"], W, H, avoid=label_rect)
 
     return out.convert("RGB")
 
