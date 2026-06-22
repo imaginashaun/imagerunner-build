@@ -410,6 +410,8 @@ V_TIGHT_MIN = 0.4            # min item-area / section-area to count as a tight 
 V_SECTION_HOLD = 2.6        # how long the camera holds a section zoom before pulling back out
 V_DASH_SPEED = 0.06         # marching-ants speed of the dotted outline (fraction of min side / s)
 V_FLASH_DUR = 0.5           # brief flash pulse on each item as it is named
+V_SECTION_MAX_AREA = 0.4    # a section bigger than this fraction of the diagram gets NO zoom/outline (would blanket)
+V_LABEL_IN, V_LABEL_HOLD, V_LABEL_OUT = 0.45, 2.4, 0.7   # brief chapter-label signpost envelope
 
 
 def _ffmpeg_exe():
@@ -724,11 +726,15 @@ def _fit_viewport(rect, W, H, fill):
     return (cx - vw / 2.0, cy - vh / 2.0, vw, vh)
 
 
-def _section_tight(sec, objs):
-    """A section is tight enough to zoom + outline only if its items fill a decent
-    fraction of its bounding box (i.e. it is a contiguous block, not scattered)."""
+def _section_tight(sec, objs, W, H):
+    """A section is zoomed + outlined only when it is a compact, contiguous block:
+    its items fill a decent fraction of its bbox AND its bbox is not so large that
+    the outline would blanket the diagram (a big/scattered section gets no frame —
+    just the per-item arrow)."""
     area = sec["w"] * sec["h"]
     if area <= 1:
+        return False
+    if area > V_SECTION_MAX_AREA * (W * H):
         return False
     used = 0.0
     for oid in sec["item_ids"]:
@@ -744,7 +750,7 @@ def _build_cam_runs(section_timeline, sections, objs, W, H):
     runs = [{"t": 0.0, "rect": None}]
     for run in section_timeline:
         sec = sections.get(run["section_id"])
-        if sec and _section_tight(sec, objs):
+        if sec and _section_tight(sec, objs, W, H):
             rect = (sec["left"], sec["top"], sec["w"], sec["h"])
             runs.append({"t": run["t"], "rect": rect})                       # zoom in
             runs.append({"t": run["t"] + V_SECTION_HOLD, "rect": None})      # pull back out
@@ -1059,9 +1065,10 @@ def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline,
     sec_run = _active_section(t, section_timeline) if sections else None
     sec = sections.get(sec_run["section_id"]) if sec_run else None
     label_rect = None
-    if sec and _section_tight(sec, objs):
+    if sec and _section_tight(sec, objs, W, H):
         from PIL import ImageDraw
-        op = _ease_out(_clamp((t - sec_run["t"]) / 0.45, 0.0, 1.0))
+        elapsed = t - sec_run["t"]
+        op = _ease_out(_clamp(elapsed / 0.45, 0.0, 1.0))   # outline stays while the section is active
         x1, y1 = _vp_map(sec["left"], sec["top"], vp, W, H)
         x2, y2 = _vp_map(sec["left"] + sec["w"], sec["top"] + sec["h"], vp, W, H)
         pad = min(W, H) * 0.016
@@ -1072,7 +1079,16 @@ def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline,
                           max(3, int(min(W, H) * 0.006)), int(min(W, H) * 0.026),
                           int(min(W, H) * 0.018), phase)
         out.alpha_composite(_with_opacity(layer, op * 0.95))
-        label_rect = _draw_section_label(out, sec["label"], op, W, H)
+        # The chapter label is a BRIEF signpost (fades out) so it never lingers and
+        # stacks under every per-item annotation.
+        if elapsed < V_LABEL_IN + V_LABEL_HOLD:
+            lab_op = elapsed / V_LABEL_IN if elapsed < V_LABEL_IN else 1.0
+        elif elapsed < V_LABEL_IN + V_LABEL_HOLD + V_LABEL_OUT:
+            lab_op = 1.0 - (elapsed - V_LABEL_IN - V_LABEL_HOLD) / V_LABEL_OUT
+        else:
+            lab_op = 0.0
+        if lab_op > 0.01:
+            label_rect = _draw_section_label(out, sec["label"], lab_op, W, H)
 
     # Pointer + brief annotation (output space); the arrow visits each named item,
     # and the annotation never overlaps the fixed chapter label.
