@@ -409,9 +409,15 @@ V_ZOOM_DUR = 0.9             # camera ease between framings (seconds)
 V_TIGHT_MIN = 0.4            # min item-area / section-area to count as a tight block
 V_SECTION_HOLD = 2.6        # how long the camera holds a section zoom before pulling back out
 V_DASH_SPEED = 0.06         # marching-ants speed of the dotted outline (fraction of min side / s)
-V_FLASH_DUR = 0.5           # brief flash pulse on each item as it is named
+V_FLASH_DUR = 0.85          # flash pulse on each point-item as it is named (strong, visible)
 V_SECTION_MAX_AREA = 0.4    # a section bigger than this fraction of the diagram gets NO zoom/outline (would blanket)
 V_LABEL_IN, V_LABEL_HOLD, V_LABEL_OUT = 0.45, 2.4, 0.7   # brief chapter-label signpost envelope
+# Spotlight LIFT: a border/raise item floats to the centre while the rest darkens,
+# eased in AND out so it never pops in or vanishes.
+V_LIFT_IN = 0.7             # grow-to-centre duration
+V_LIFT_OUT = 0.5            # shrink-back duration before the item is done
+V_LIFT_DIM = 0.82           # how much the background darkens under a lift (alpha of black)
+V_LIFT_FILL = 0.52          # fraction of the frame the centred lifted card fills
 
 
 def _ffmpeg_exe():
@@ -819,11 +825,13 @@ def _draw_dotted_rect(d, x1, y1, x2, y2, color, width, dash, gap, phase=0.0):
 _ARROW_CACHE = {}
 
 
-def _arrow_img(size):
-    """A glossy, bevelled arrow pointing DOWN (tip at bottom centre), cached."""
+def _arrow_img(size, up=False):
+    """A glossy, bevelled arrow pointing DOWN (tip at bottom centre), or UP when
+    `up` is set (so an item near the top edge is pointed at from below), cached."""
     size = int(size)
-    if size in _ARROW_CACHE:
-        return _ARROW_CACHE[size]
+    key = (size, bool(up))
+    if key in _ARROW_CACHE:
+        return _ARROW_CACHE[key]
     from PIL import ImageChops, ImageDraw, ImageFilter
     Wd = size
     Hd = int(size * 1.3)
@@ -870,9 +878,13 @@ def _arrow_img(size):
     out.alpha_composite(outline)
     out.alpha_composite(body)
     out.alpha_composite(specL)
-    meta = {"tip": (canvas[0] / 2, oy + Hd), "size": canvas}
-    _ARROW_CACHE[size] = (out, meta)
-    return _ARROW_CACHE[size]
+    tip = (canvas[0] / 2, oy + Hd)
+    if up:
+        out = out.rotate(180)
+        tip = (canvas[0] - tip[0], canvas[1] - tip[1])
+    meta = {"tip": tip, "size": canvas}
+    _ARROW_CACHE[key] = (out, meta)
+    return _ARROW_CACHE[key]
 
 
 def _focus_at(t, focus_seq):
@@ -904,35 +916,109 @@ def _target_top_center(oid, objs, by_obj, t, H):
     return (o["left"] + o["w"] / 2, o["top"])
 
 
-def _draw_pointer(out, focus_seq, objs, by_obj, t, vp, W, H):
-    cur, prev = _focus_at(t, focus_seq)
-    if not cur:
-        return None
-    arrow, meta = _arrow_img(int(_clamp(min(W, H) * 0.055, 32, 104)))
-    tipx_off, tipy_off = meta["tip"]
-    aw, ah = meta["size"]
+def _item_rect_out(oid, objs, vp, W, H):
+    """An object's bbox mapped into OUTPUT (post-camera) coordinates: [x1,y1,x2,y2]."""
+    o = objs[oid]
+    x1, y1 = _vp_map(o["left"], o["top"], vp, W, H)
+    x2, y2 = _vp_map(o["left"] + o["w"], o["top"] + o["h"], vp, W, H)
+    return [x1, y1, x2, y2]
 
-    cur_s = _target_top_center(cur["object_id"], objs, by_obj, t, H)
-    if cur_s is None:
+
+def _draw_pointer(out, focus_seq, objs, by_obj, t, vp, W, H):
+    """Lands the arrow ON the current item (glides from the previous one). Points
+    DOWN from just above the item, or UP from just below it when the item hugs the
+    top edge — so the arrow never detaches to the frame edge."""
+    cur, prev = _focus_at(t, focus_seq)
+    if not cur or cur["object_id"] not in objs:
         return None
-    cur_pt = _vp_map(cur_s[0], cur_s[1], vp, W, H)
-    if prev:
-        prev_s = _target_top_center(prev["object_id"], objs, by_obj, t, H)
-        prev_pt = _vp_map(prev_s[0], prev_s[1], vp, W, H) if prev_s else cur_pt
+
+    cur_rect = _item_rect_out(cur["object_id"], objs, vp, W, H)
+    if prev and prev["object_id"] in objs:
+        prev_rect = _item_rect_out(prev["object_id"], objs, vp, W, H)
         gp = _ease_in_out(_clamp((t - cur["t"]) / V_GLIDE, 0.0, 1.0))
     else:
-        prev_pt, gp = cur_pt, 1.0
+        prev_rect, gp = cur_rect, 1.0
+    rect = [prev_rect[i] + (cur_rect[i] - prev_rect[i]) * gp for i in range(4)]
+    x1, y1, x2, y2 = rect
+    cx = (x1 + x2) / 2.0
 
-    tip_x = prev_pt[0] + (cur_pt[0] - prev_pt[0]) * gp
-    tip_y = prev_pt[1] + (cur_pt[1] - prev_pt[1]) * gp
-    gap = ah * 0.10 + math.sin(t * 2.3) * (ah * 0.05)
-    tip_y -= gap
+    size = int(_clamp(min(W, H) * 0.055, 32, 104))
+    point_up = y1 < H * 0.2   # item hugs the top → point UP from below it
+    arrow, meta = _arrow_img(size, up=point_up)
+    aw, ah = meta["size"]
+    tipx_off, tipy_off = meta["tip"]
+    bob = math.sin(t * 2.3) * (ah * 0.05)
+    if point_up:
+        tip_x, tip_y = cx, y2 + ah * 0.12 + bob
+    else:
+        tip_x, tip_y = cx, y1 - ah * 0.12 - bob
 
-    left = int(round(tip_x - tipx_off))
+    left = int(round(_clamp(tip_x - tipx_off, 4 - aw, W - 4)))
     top = int(round(tip_y - tipy_off))
     op = _clamp((t - cur["t"]) / 0.3, 0.0, 1.0) if not prev else 1.0
     out.alpha_composite(_with_opacity(arrow, op), (left, top))
-    return (tip_x, top)
+    # Annotation anchor: just outside the arrow, on the side away from the item.
+    return (tip_x, top if not point_up else top + ah, point_up)
+
+
+def _draw_flash(out, o, in_t, t, vp, W, H):
+    """A strong, clearly-visible pulse on a point-item as it is named: a glowing
+    accent ring around it (far more visible than a faint brightness bump)."""
+    if not o:
+        return
+    fe = t - in_t
+    if not (0.0 <= fe < V_FLASH_DUR):
+        return
+    from PIL import ImageDraw, ImageFilter
+    pulse = math.sin(fe / V_FLASH_DUR * math.pi)
+    x1, y1 = _vp_map(o["left"], o["top"], vp, W, H)
+    x2, y2 = _vp_map(o["left"] + o["w"], o["top"] + o["h"], vp, W, H)
+    pad = max(4.0, min(W, H) * 0.012)
+    x1 -= pad; y1 -= pad; x2 += pad; y2 += pad
+    rad = int(_clamp(min(x2 - x1, y2 - y1) * 0.12, 6, 44))
+    wdt = max(4, int(min(W, H) * 0.011))
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).rounded_rectangle([x1, y1, x2, y2], radius=rad, outline=V_ACCENT + (255,), width=wdt)
+    glow = glow.filter(ImageFilter.GaussianBlur(int(min(W, H) * 0.014)))
+    out.alpha_composite(_with_opacity(glow, pulse))
+    ring = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(ring).rounded_rectangle([x1, y1, x2, y2], radius=rad, outline=V_ACCENT_HI + (255,), width=max(3, wdt // 2))
+    out.alpha_composite(_with_opacity(ring, pulse * 0.95))
+
+
+def _draw_lift(out, o, obj_cues, cur, t, vp, W, H):
+    """Spotlight LIFT: darken the whole frame and float the item to the centre,
+    enlarged, eased IN and OUT so it grows in and shrinks back (never pops)."""
+    in_t = cur["t"]
+    out_t = None
+    for c in obj_cues:
+        if c.get("action") == "out" and c["t"] > in_t + 1e-6:
+            out_t = c["t"]
+            break
+    e = t - in_t
+    p_in = _ease_out(_clamp(e / V_LIFT_IN, 0.0, 1.0))
+    p_out = _ease_out(_clamp((out_t - t) / V_LIFT_OUT, 0.0, 1.0)) if out_t is not None else 1.0
+    p = max(0.0, min(p_in, p_out))
+    if p <= 0.01:
+        return None
+
+    dim = Image.new("RGBA", (W, H), (0, 0, 0, int(255 * V_LIFT_DIM)))
+    out.alpha_composite(_with_opacity(dim, p))
+
+    x1, y1 = _vp_map(o["left"], o["top"], vp, W, H)
+    x2, y2 = _vp_map(o["left"] + o["w"], o["top"] + o["h"], vp, W, H)
+    sw, sh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+    scx, scy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    s = _clamp(min(V_LIFT_FILL * W / sw, V_LIFT_FILL * H / sh), 1.0, 5.0)
+    nw = max(1, int(round(sw * (1.0 + (s - 1.0) * p))))
+    nh = max(1, int(round(sh * (1.0 + (s - 1.0) * p))))
+    cx = scx + (W / 2.0 - scx) * p
+    cy = scy + (H * 0.5 - scy) * p
+    card = o["img"].resize((nw, nh), Image.LANCZOS)
+    left, top = int(round(cx - nw / 2)), int(round(cy - nh / 2))
+    _paste_card(out, card, left, top, 1.0,
+                shadow=0.6 * p, shadow_blur=int(max(14, nh * 0.06)), shadow_dy=int(max(10, nh * 0.05)))
+    return (cx, top, False)
 
 
 def _rects_overlap(a, b):
@@ -966,10 +1052,12 @@ def _draw_annotation(frame, text, anchor, t, t0, W, H, avoid=None):
     gap = int(fs * 0.45)
     pillw = padx + dot + gap + tw + padx
     pillh = th + pady * 2
-    anchor_x, arrow_top = anchor
+    anchor_x, anchor_y = anchor[0], anchor[1]
+    below = bool(anchor[2]) if len(anchor) > 2 else False
     x0 = int(_clamp(anchor_x - pillw / 2, 8, W - pillw - 8))
-    y0 = int(arrow_top - pillh - int(fs * 0.45))
-    below_y = int(_clamp(arrow_top + int(fs * 1.6), 8, H - pillh - 8))
+    above_y = int(anchor_y - pillh - int(fs * 0.45))
+    below_y = int(_clamp(anchor_y + int(fs * 1.4), 8, H - pillh - 8))
+    y0 = below_y if below else above_y
     if y0 < 8:
         y0 = below_y
     # Never collide with the fixed section-label pill — drop below the arrow instead.
@@ -1012,47 +1100,11 @@ def _draw_section_label(frame, text, op, W, H):
 
 
 def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H):
-    active, presented, pres_cue = _active_state(t, by_obj)
     cur, _prev = _focus_at(t, focus_seq)
-    superseded = (presented is not None and cur is not None
-                  and cur["object_id"] != presented and cur["t"] > pres_cue["t"] + 1e-6)
-    pres_elapsed = (t - pres_cue["t"]) if pres_cue else 0.0
-    hero = presented is not None and pres_elapsed >= V_BORDER_DUR and not superseded
 
-    def fade(c):
-        return _clamp((t - c["t"]) / V_FADE, 0.0, 1.0) if V_FADE > 0 else 1.0
-
-    # STAGE (diagram coords): base + in-place lifted cards. point items get no card
-    # (the arrow alone follows them); border = gentle lift; the core raise = a
-    # stronger in-place lift. No blanket dim — the camera + arrow provide the focus.
-    stage = base.convert("RGBA").copy()
-    for oid, c in active.items():
-        if c.get("type") == "point":
-            continue
-        if oid == presented:
-            strong = hero or superseded
-            op = (1.0 - _clamp((t - cur["t"]) / V_FADE, 0.0, 1.0)) if superseded else fade(pres_cue)
-            if op <= 0.01:
-                continue
-            nw, nh, left, top = _lift_rect(objs[oid], pres_elapsed, t, H, strong=strong)
-            _paste_card(stage, objs[oid]["img"].resize((nw, nh)), left, top, op,
-                        shadow=0.6 if strong else 0.5, shadow_blur=int(max(12, nh * 0.06)), shadow_dy=int(max(8, nh * 0.05)))
-        else:
-            nw, nh, left, top = _lift_rect(objs[oid], t - c["t"], t, H, strong=(c.get("type") == "border"))
-            _paste_card(stage, objs[oid]["img"].resize((nw, nh)), left, top, fade(c),
-                        shadow=0.5, shadow_blur=int(max(10, nh * 0.06)), shadow_dy=int(max(8, nh * 0.05)))
-
-    # FLASH the current point-item as it is named (lift is the animation for
-    # border/raise; flashing gives the lighter point items their own punctuation).
-    if cur and cur.get("type") not in ("border", "raise"):
-        fe = t - cur["t"]
-        if 0.0 <= fe < V_FLASH_DUR:
-            o = objs.get(cur["object_id"])
-            if o:
-                pulse = math.sin(fe / V_FLASH_DUR * math.pi)
-                stage.alpha_composite(
-                    _with_opacity(_brightness(o["img"], 1.0 + 0.7 * pulse), 0.5 * pulse),
-                    (o["left"], o["top"]))
+    # STAGE = the diagram only. Lifts/flashes/arrows are OUTPUT-space overlays drawn
+    # AFTER the camera, so they stay crisp and correctly placed at any zoom.
+    stage = base.convert("RGBA")
 
     # CAMERA: zoomed out with margin by default; eased into the current tight
     # section briefly, then back out so the whole diagram is visible again.
@@ -1090,12 +1142,20 @@ def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline,
         if lab_op > 0.01:
             label_rect = _draw_section_label(out, sec["label"], lab_op, W, H)
 
-    # Pointer + brief annotation (output space); the arrow visits each named item,
-    # and the annotation never overlaps the fixed chapter label.
-    anchor = _draw_pointer(out, focus_seq, objs, by_obj, t, vp, W, H)
-    if cur and anchor:
-        _draw_annotation(out, objs.get(cur["object_id"], {}).get("label", ""),
-                         anchor, t, cur["t"], W, H, avoid=label_rect)
+    # The current item: a border/raise LIFTS (darken the rest + float to centre);
+    # a point flashes + gets the gliding arrow. Drawn over the section outline.
+    lift = cur is not None and cur.get("type") in ("border", "raise") and cur["object_id"] in objs
+    if lift:
+        anchor = _draw_lift(out, objs[cur["object_id"]], by_obj.get(cur["object_id"], []), cur, t, vp, W, H)
+        if anchor:
+            _draw_annotation(out, objs[cur["object_id"]].get("label", ""), anchor, t, cur["t"], W, H)
+    else:
+        if cur and cur["object_id"] in objs:
+            _draw_flash(out, objs[cur["object_id"]], cur["t"], t, vp, W, H)
+        anchor = _draw_pointer(out, focus_seq, objs, by_obj, t, vp, W, H)
+        if cur and anchor:
+            _draw_annotation(out, objs.get(cur["object_id"], {}).get("label", ""),
+                             anchor, t, cur["t"], W, H, avoid=label_rect)
 
     return out.convert("RGB")
 
