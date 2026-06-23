@@ -986,18 +986,25 @@ def _draw_flash(out, o, in_t, t, vp, W, H):
     out.alpha_composite(_with_opacity(ring, pulse * 0.95))
 
 
-def _draw_lift(out, o, obj_cues, cur, t, vp, W, H):
+def _draw_lift(out, o, obj_cues, cur, t, vp, W, H, hold_until=None):
     """Spotlight LIFT: darken the whole frame and float the item to the centre,
-    enlarged, eased IN and OUT so it grows in and shrinks back (never pops)."""
+    enlarged, eased IN and OUT so it grows in and shrinks back (never pops).
+
+    The lift stays up for the WHOLE time the narration is discussing the item — i.e.
+    until the NEXT item is named (`hold_until`) — not merely until its short name
+    finishes. The model tends to close an item's `out` cue right after the name, so
+    relying on that alone made the card drop back down while still being talked about.
+    Falls back to the item's own `out` cue for the final item (nothing follows it)."""
     in_t = cur["t"]
-    out_t = None
+    own_out = None
     for c in obj_cues:
         if c.get("action") == "out" and c["t"] > in_t + 1e-6:
-            out_t = c["t"]
+            own_out = c["t"]
             break
+    end_t = hold_until if hold_until is not None else own_out
     e = t - in_t
     p_in = _ease_out(_clamp(e / V_LIFT_IN, 0.0, 1.0))
-    p_out = _ease_out(_clamp((out_t - t) / V_LIFT_OUT, 0.0, 1.0)) if out_t is not None else 1.0
+    p_out = _ease_out(_clamp((end_t - t) / V_LIFT_OUT, 0.0, 1.0)) if end_t is not None else 1.0
     p = max(0.0, min(p_in, p_out))
     if p <= 0.01:
         return None
@@ -1099,12 +1106,72 @@ def _draw_section_label(frame, text, op, W, H):
     return (px, py, px + pw, py + ph)
 
 
-def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H):
+def _hover_viewport(t, phase_t, W, H):
+    """The default (full-diagram) viewport, but gently RAISED toward the viewer (a
+    slight eased zoom-in) and HOVERING (a soft vertical bob) — used for the intro and
+    outro so the whole diagram floats while it is introduced / wrapped up."""
+    vx, vy, vw, vh = _default_viewport(W, H)
+    e = max(0.0, t - phase_t)
+    rise = _ease_out(_clamp(e / 0.8, 0.0, 1.0))
+    zoom = 1.0 - 0.035 * rise                      # up to ~3.5% larger = "raised"
+    bob = math.sin(t * 1.3) * (H * 0.012) * rise   # gentle hover
+    cx, cy = vx + vw / 2.0, vy + vh / 2.0
+    nw, nh = vw * zoom, vh * zoom
+    return (cx - nw / 2.0, cy - nh / 2.0 + bob, nw, nh)
+
+
+def _draw_whole_outline(stage, whole_bbox, t, intro_end, outro_start, in_intro, bg, W, H):
+    """INTRO / OUTRO treatment: present the ENTIRE diagram in full view, gently raised
+    and hovering, with a marching dotted border tracing all the way around it. Used
+    before the first item is named (intro) and during the closing takeaway (outro)."""
+    from PIL import ImageDraw
+    phase_t = 0.0 if in_intro else outro_start
+    vp = _hover_viewport(t, phase_t, W, H)
+    out = _apply_viewport(stage, vp, bg, W, H)
+
+    if in_intro:
+        if t < 0.6:
+            op = _ease_out(_clamp(t / 0.6, 0.0, 1.0))
+        elif t < intro_end - 0.4:
+            op = 1.0
+        else:
+            op = _clamp((intro_end - t) / 0.4, 0.0, 1.0)
+    else:
+        op = _ease_out(_clamp((t - outro_start) / 0.5, 0.0, 1.0))
+    if op <= 0.01:
+        return out
+
+    bx1, by1 = _vp_map(whole_bbox[0], whole_bbox[1], vp, W, H)
+    bx2, by2 = _vp_map(whole_bbox[2], whole_bbox[3], vp, W, H)
+    pad = min(W, H) * 0.022
+    bx1 = max(2.0, bx1 - pad); by1 = max(2.0, by1 - pad)
+    bx2 = min(W - 2.0, bx2 + pad); by2 = min(H - 2.0, by2 + pad)
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    phase = t * V_DASH_SPEED * min(W, H)
+    _draw_dotted_rect(ImageDraw.Draw(layer), bx1, by1, bx2, by2, V_ACCENT + (255,),
+                      max(4, int(min(W, H) * 0.0075)), int(min(W, H) * 0.028),
+                      int(min(W, H) * 0.02), phase)
+    out.alpha_composite(_with_opacity(layer, op * 0.95))
+    return out
+
+
+def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H,
+                   intro_end=0.0, outro_start=None, whole_bbox=None):
     cur, _prev = _focus_at(t, focus_seq)
+
+    # INTRO (before the first item is named) and OUTRO (during the closing takeaway,
+    # after the last item's `out`) get the whole-diagram float + marching border so
+    # the opening and conclusion are never a static frame.
+    stage_rgba = base.convert("RGBA")
+    in_intro = bool(focus_seq) and t < intro_end - 0.05
+    in_outro = outro_start is not None and t > outro_start + 0.05
+    if (in_intro or in_outro) and whole_bbox is not None:
+        return _draw_whole_outline(stage_rgba, whole_bbox, t, intro_end, outro_start,
+                                   in_intro, bg, W, H).convert("RGB")
 
     # STAGE = the diagram only. Lifts/flashes/arrows are OUTPUT-space overlays drawn
     # AFTER the camera, so they stay crisp and correctly placed at any zoom.
-    stage = base.convert("RGBA")
+    stage = stage_rgba
 
     # CAMERA: zoomed out with margin by default; eased into the current tight
     # section briefly, then back out so the whole diagram is visible again.
@@ -1146,7 +1213,13 @@ def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline,
     # a point flashes + gets the gliding arrow. Drawn over the section outline.
     lift = cur is not None and cur.get("type") in ("border", "raise") and cur["object_id"] in objs
     if lift:
-        anchor = _draw_lift(out, objs[cur["object_id"]], by_obj.get(cur["object_id"], []), cur, t, vp, W, H)
+        next_focus_t = None
+        for c in focus_seq:
+            if c["t"] > cur["t"] + 1e-6:
+                next_focus_t = c["t"]
+                break
+        anchor = _draw_lift(out, objs[cur["object_id"]], by_obj.get(cur["object_id"], []), cur, t, vp, W, H,
+                            hold_until=next_focus_t)
         if anchor:
             _draw_annotation(out, objs[cur["object_id"]].get("label", ""), anchor, t, cur["t"], W, H)
     else:
@@ -1167,17 +1240,19 @@ def _compose_frame(t, base, objs, by_obj, focus_seq, sections, section_timeline,
 _MP = {}
 
 
-def _mp_init(base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H, frames_dir):
+def _mp_init(base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H, frames_dir,
+             intro_end, outro_start, whole_bbox):
     _MP.update(base=base, objs=objs, by_obj=by_obj, focus_seq=focus_seq,
                sections=sections, section_timeline=section_timeline,
-               cam_runs=cam_runs, bg=bg, W=W, H=H, dir=frames_dir)
+               cam_runs=cam_runs, bg=bg, W=W, H=H, dir=frames_dir,
+               intro_end=intro_end, outro_start=outro_start, whole_bbox=whole_bbox)
 
 
 def _mp_frame(args):
     fi, t = args
     _compose_frame(t, _MP["base"], _MP["objs"], _MP["by_obj"], _MP["focus_seq"],
                    _MP["sections"], _MP["section_timeline"], _MP["cam_runs"], _MP["bg"],
-                   _MP["W"], _MP["H"]).save(
+                   _MP["W"], _MP["H"], _MP["intro_end"], _MP["outro_start"], _MP["whole_bbox"]).save(
         os.path.join(_MP["dir"], f"f{fi:05d}.png"))
 
 
@@ -1215,6 +1290,22 @@ def render_narration_video(scene, fps=24):
         cam_runs = _build_cam_runs(section_timeline, sections, objs, W, H)
         bg = _bg_color(base)
 
+        # Intro = before the first item is named; outro = after the last item's `out`
+        # (the closing takeaway). Both get the whole-diagram float + marching border.
+        intro_end = focus_seq[0]["t"] if focus_seq else 0.0
+        out_times = [c["t"] for seq in by_obj.values() for c in seq
+                     if c.get("action") == "out" and c.get("t") is not None]
+        outro_start = max(out_times) if out_times else total
+        if objs:
+            whole_bbox = (
+                min(o["left"] for o in objs.values()),
+                min(o["top"] for o in objs.values()),
+                max(o["left"] + o["w"] for o in objs.values()),
+                max(o["top"] + o["h"] for o in objs.values()),
+            )
+        else:
+            whole_bbox = (0, 0, W, H)
+
         nframes = max(1, int(math.ceil(total * fps)))
         frames_dir = os.path.join(work, "frames")
         os.makedirs(frames_dir)
@@ -1223,10 +1314,12 @@ def render_narration_video(scene, fps=24):
         if nproc > 1 and nframes > 8:
             import multiprocessing as mp
             with mp.Pool(processes=nproc, initializer=_mp_init,
-                         initargs=(base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H, frames_dir)) as pool:
+                         initargs=(base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H, frames_dir,
+                                   intro_end, outro_start, whole_bbox)) as pool:
                 pool.map(_mp_frame, frame_args, chunksize=4)
         else:
-            _mp_init(base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H, frames_dir)
+            _mp_init(base, objs, by_obj, focus_seq, sections, section_timeline, cam_runs, bg, W, H, frames_dir,
+                     intro_end, outro_start, whole_bbox)
             for a in frame_args:
                 _mp_frame(a)
 
