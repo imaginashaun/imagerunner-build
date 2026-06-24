@@ -70,6 +70,44 @@ def _find(out_dir, *suffixes):
     return None
 
 
+def detect_shapes(image_path):
+    """Detect candidate WHOLE-ELEMENT boxes in a diagram via classical CV, so the
+    semantic detector's rough boxes can be snapped to real element extents (a box
+    outline, a filled block, an icon). Two passes — outlined boxes (Canny) and filled
+    shapes (non-white) — union'd. Returns [[x1,y1,x2,y2], ...] in ORIGINAL pixels.
+    Best-effort: returns [] if OpenCV is unavailable.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return [], None
+    im = cv2.imread(image_path)
+    if im is None:
+        return [], None
+    H, W = im.shape[:2]
+    area = float(W * H)
+    gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+    boxes = []
+
+    def collect(mask):
+        cnts, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
+            a = w * h
+            if a < 0.004 * area or a > 0.45 * area:
+                continue
+            if w < 24 or h < 18 or (w / float(h)) > 20:
+                continue
+            boxes.append([int(x), int(y), int(x + w), int(y + h)])
+
+    edges = cv2.dilate(cv2.Canny(gray, 30, 120), np.ones((3, 3), np.uint8), iterations=2)
+    collect(edges)
+    nonwhite = cv2.morphologyEx((gray < 238).astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    collect(nonwhite)
+    return boxes, [W, H]
+
+
 def handler(job):
     work = None
     try:
@@ -121,10 +159,14 @@ def handler(job):
                 images[name] = None
                 print(f"[MINERU] upload failed for {name}: {e}", flush=True)
 
+        shape_boxes, image_size = detect_shapes(img)
+
         return {
             "middle": middle,
             "content_list": content_list,
             "images": images,
+            "shape_boxes": shape_boxes,
+            "image_size": image_size,
             "backend": backend,
         }
     except subprocess.TimeoutExpired:
