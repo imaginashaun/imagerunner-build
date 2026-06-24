@@ -32,4 +32,4 @@ jobs:
           context: ./mineru
           platforms: linux/amd64
           push: true
-          tags: imaginashaun/mineru-runner:v2
+          tags: imaginashaun/mineru-runner:v3
