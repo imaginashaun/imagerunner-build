@@ -2,6 +2,9 @@ name: build-imagerunner
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'mineru/**'
+      - '.github/workflows/build-mineru.yml'
   workflow_dispatch:
 jobs:
   build:
