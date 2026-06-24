@@ -113,6 +113,7 @@ def handler(job):
     try:
         inp = job.get("input", {}) or {}
         backend = str(inp.get("backend") or "vlm-engine")
+        mode = str(inp.get("mode") or "full")
         lid = inp.get("lesson_item_id")
 
         work = tempfile.mkdtemp(prefix="mineru_")
@@ -124,6 +125,13 @@ def handler(job):
                 f.write(base64.b64decode(inp["image_base64"]))
         else:
             return {"error": "missing image_url or image_base64"}
+
+        # FAST PATH: shape detection only (classical CV, no VLM). This avoids the slow
+        # vLLM cold-start + parse so whole-element box snapping is reliable on the
+        # pipeline's critical path. Returns in ~seconds (container boot + OpenCV).
+        if mode == "shapes":
+            shape_boxes, image_size = detect_shapes(img)
+            return {"mode": "shapes", "shape_boxes": shape_boxes, "image_size": image_size}
 
         out = os.path.join(work, "out")
         os.makedirs(out, exist_ok=True)
