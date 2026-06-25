@@ -579,6 +579,69 @@ def _paste_card(frame, card, left, top, op, shadow=0.5, shadow_blur=20, shadow_d
 
 
 # ── Scene -> render inputs ───────────────────────────────────────────────────
+def _v_detect_shapes(base):
+    """Whole-element candidate boxes via classical CV, measured in the EXACT pixel
+    space of the base image the renderer draws in — so snapping can NEVER introduce a
+    coordinate mismatch (no padding/old-size/new-size ambiguity). Two passes (outlined
+    boxes via Canny + filled shapes via non-white), unioned. Best-effort → [] on error.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return []
+    try:
+        arr = np.array(base.convert("RGB"))[:, :, ::-1].copy()  # RGB -> BGR
+        H, W = arr.shape[:2]
+        area = float(W * H)
+        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        boxes = []
+
+        def collect(mask):
+            cnts, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            for c in cnts:
+                x, y, w, h = cv2.boundingRect(c)
+                a = w * h
+                if a < 0.004 * area or a > 0.45 * area:
+                    continue
+                if w < 24 or h < 18 or (w / float(h)) > 20:
+                    continue
+                boxes.append((x, y, x + w, y + h))
+
+        edges = cv2.dilate(cv2.Canny(gray, 30, 120), np.ones((3, 3), np.uint8), iterations=2)
+        collect(edges)
+        nonwhite = cv2.morphologyEx((gray < 238).astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        collect(nonwhite)
+        return boxes
+    except Exception:
+        return []
+
+
+def _v_snap_objects(objects, shapes):
+    """Snap each object's box to the real WHOLE-ELEMENT shape it sits in. A detector's
+    box is often a fragment (just the word "Encoder"); snapping to the enclosing
+    detected shape recovers the whole block + label. Picks the smallest shape that
+    contains the box centre and is >=55% of the rough box area (so it never collapses
+    onto a tiny token inside), else the smallest containing shape. Leaves the box
+    unchanged when nothing contains it. Mutates `objects` in place."""
+    if not shapes:
+        return
+    for o in objects:
+        b = o.get("bbox")
+        if not b or len(b) != 4:
+            continue
+        x1, y1, x2, y2 = [float(v) for v in b]
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        rough = max(1.0, (x2 - x1) * (y2 - y1))
+        cont = [s for s in shapes if s[0] - 2 <= cx <= s[2] + 2 and s[1] - 2 <= cy <= s[3] + 2]
+        if not cont:
+            continue
+        big = [s for s in cont if (s[2] - s[0]) * (s[3] - s[1]) >= 0.55 * rough]
+        pool = big or cont
+        s = min(pool, key=lambda s: (s[2] - s[0]) * (s[3] - s[1]))
+        o["bbox"] = [float(s[0]), float(s[1]), float(s[2]), float(s[3])]
+
+
 def _build_objs(scene, base, W, H):
     """Rounded-rect base crops for every object (no SAM masks)."""
     objs = {}
@@ -718,9 +781,12 @@ def _bg_color(base):
 
 
 def _default_viewport(W, H):
-    vw = W / (1.0 - 2.0 * V_MARGIN)
-    vh = H / (1.0 - 2.0 * V_MARGIN)
-    return (-(vw - W) / 2.0, -(vh - H) / 2.0, vw, vh)
+    # Stable, full-frame view: NO zoomed-out margin. The margin rendered white padding
+    # around the diagram, which (a) read as confusing empty space and (b) made the
+    # camera scale the diagram, so lift cards (placed through the camera transform)
+    # appeared to drift. The diagram now fills the frame 1:1; lifts/outline/arrows are
+    # crisp output-space overlays on top.
+    return (0.0, 0.0, float(W), float(H))
 
 
 def _fit_viewport(rect, W, H, fill):
@@ -751,18 +817,12 @@ def _section_tight(sec, objs, W, H):
 
 
 def _build_cam_runs(section_timeline, sections, objs, W, H):
-    """Punch INTO a tight section briefly at its start, then pull back OUT so the
-    whole diagram is visible again while the arrow walks the section's items."""
-    runs = [{"t": 0.0, "rect": None}]
-    for run in section_timeline:
-        sec = sections.get(run["section_id"])
-        if sec and _section_tight(sec, objs, W, H):
-            rect = (sec["left"], sec["top"], sec["w"], sec["h"])
-            runs.append({"t": run["t"], "rect": rect})                       # zoom in
-            runs.append({"t": run["t"] + V_SECTION_HOLD, "rect": None})      # pull back out
-        else:
-            runs.append({"t": run["t"], "rect": None})
-    return runs
+    """No camera punch. Section emphasis is the marching dotted OUTLINE only (an
+    output-space overlay). The previous per-section zoom-IN-then-pull-OUT collided
+    with a lift's exit: the section pull-out (the whole region shrinking back) played
+    at the same time as the lifted card shrinking back, so two things appeared to
+    "animate out" at once. A single stable framing removes that entirely."""
+    return [{"t": 0.0, "rect": None}]
 
 
 def _camera(t, cam_runs, W, H):
@@ -1265,6 +1325,12 @@ def render_narration_video(scene, fps=24):
         W -= W % 2  # libx264 needs even dimensions
         H -= H % 2
         base = base.crop((0, 0, W, H))
+
+        # SNAP each object's box to its real whole-element shape, measured on THIS base
+        # image (exact render space) — so a lift shows the whole block + label, never a
+        # text fragment, and there is no coordinate-space mismatch. On by default.
+        if scene.get("snap_to_shapes", True):
+            _v_snap_objects(scene.get("objects", []), _v_detect_shapes(base))
 
         # Rounded-rect crops from the base image (general shapes that "lift"); the
         # jagged SAM alpha masks are set aside.
