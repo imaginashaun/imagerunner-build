@@ -405,7 +405,7 @@ V_AMBIENT = 0.02              # (unused) legacy ambient breath
 # frames it). No whole-frame breathing — the frame stays stable.
 V_MARGIN = 0.11             # background margin around the diagram (zoomed-out default)
 V_SECTION_FILL = 0.8         # fraction of the frame a zoomed-in section fills
-V_ZOOM_DUR = 0.9             # camera ease between framings (seconds)
+V_ZOOM_DUR = 1.15            # camera ease between framings (seconds) — gentle, not jarring
 V_TIGHT_MIN = 0.4            # min item-area / section-area to count as a tight block
 V_SECTION_HOLD = 2.6        # how long the camera holds a section zoom before pulling back out
 V_DASH_SPEED = 0.06         # marching-ants speed of the dotted outline (fraction of min side / s)
@@ -816,13 +816,30 @@ def _section_tight(sec, objs, W, H):
     return (used / area) >= V_TIGHT_MIN
 
 
+def _section_small(sec, W, H):
+    """Zoom in only when the section's block is a SMALL part of the frame — i.e. its
+    content is fine/dense at full view, so enlarging it actually helps the viewer read it
+    wholistically. Big sections are already legible and stay at full view."""
+    return (sec["w"] * sec["h"]) < 0.28 * (W * H) and sec["w"] < 0.62 * W and sec["h"] < 0.62 * H
+
+
 def _build_cam_runs(section_timeline, sections, objs, W, H):
-    """No camera punch. Section emphasis is the marching dotted OUTLINE only (an
-    output-space overlay). The previous per-section zoom-IN-then-pull-OUT collided
-    with a lift's exit: the section pull-out (the whole region shrinking back) played
-    at the same time as the lifted card shrinking back, so two things appeared to
-    "animate out" at once. A single stable framing removes that entirely."""
-    return [{"t": 0.0, "rect": None}]
+    """SELECTIVE zoom: ease into a section's framing ONLY when it is a tight, contiguous
+    block AND small enough that the full-frame view makes it hard to read — so a dense or
+    fine-print section is seen enlarged and wholistically. Large or scattered sections
+    keep the full view. The framing only ever CHANGES at a section boundary (there is no
+    separate mid-section pull-out), so a camera move lands exactly as one section's last
+    lift has settled and the next section is rising — both ENTERING motions, never on top
+    of a lift's EXIT (the old pull-out-vs-shrink-out collision that made two cards seem to
+    animate out at once)."""
+    runs = [{"t": 0.0, "rect": None}]
+    for run in section_timeline:
+        sec = sections.get(run["section_id"])
+        if sec and _section_tight(sec, objs, W, H) and _section_small(sec, W, H):
+            runs.append({"t": run["t"], "rect": (sec["left"], sec["top"], sec["w"], sec["h"])})
+        else:
+            runs.append({"t": run["t"], "rect": None})
+    return runs
 
 
 def _camera(t, cam_runs, W, H):
