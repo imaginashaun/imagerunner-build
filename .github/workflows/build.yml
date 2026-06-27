@@ -32,4 +32,4 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: imaginashaun/imagerunner:v11
+          tags: imaginashaun/imagerunner:v12
