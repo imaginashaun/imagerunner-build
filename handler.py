@@ -1464,6 +1464,22 @@ def handler(job):
             traceback.print_exc()
             return {"error": "video_render_failed", "message": str(e), "trace": traceback.format_exc()[-1500:]}
 
+    # ── Shape-detection mode (classical CV; no SAM3/model load, returns fast) ──
+    # Returns RAW candidate element boxes. The caller (PHP) cleans/dedups them, renders
+    # a numbered overlay, and has the VLM LABEL the boxes — the VLM never invents
+    # coordinates, which is what was producing tiled/duplicate/oversized boxes.
+    if inp.get("mode") == "detect_shapes":
+        image_url = inp.get("image_url")
+        if not image_url:
+            raise ValueError("detect_shapes mode requires input.image_url")
+        resp = http_requests.get(image_url, timeout=30)
+        resp.raise_for_status()
+        image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        w, h = image.size
+        boxes = _v_detect_shapes(image)
+        print(f"[SHAPES] {len(boxes)} candidate boxes for {w}x{h}", flush=True)
+        return {"shape_boxes": [list(b) for b in boxes], "image_width": w, "image_height": h}
+
     # Segmentation path needs the SAM3 model — load it on first use.
     ensure_model()
 
